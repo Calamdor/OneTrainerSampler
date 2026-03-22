@@ -82,10 +82,38 @@ class BaseSamplerBackend(ABC):
         from modules.util.torch_util import torch_gc
         self.remove_loras()
         if self.model is not None:
-            del self.model
+            # Move all components back to CPU in case sampling was interrupted
+            # and left something on GPU.
+            for _fn in ("transformer_to", "text_encoder_to", "vae_to"):
+                try:
+                    getattr(self.model, _fn)(self.temp_device)
+                except Exception:
+                    pass
+            torch_gc()  # free VRAM before dropping CPU tensors
+
+            # torch.compile caches compiled graphs that hold tensor references;
+            # reset clears those so the underlying storage can be freed.
+            try:
+                import torch._dynamo
+                torch._dynamo.reset()
+            except Exception:
+                pass
+
+            # Explicitly delete large sub-components by name so their reference
+            # counts drop immediately rather than waiting for cyclic GC.
+            model = self.model
             self.model = None
+            for _attr in ("transformer", "text_encoder", "vae",
+                          "transformer_offload_conductor"):
+                try:
+                    delattr(model, _attr)
+                except AttributeError:
+                    pass
+            del model
             gc.collect()
+            gc.collect()  # second pass catches cycles broken by the first
             torch_gc()
+
         if on_status:
             on_status("Unloaded")
 

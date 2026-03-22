@@ -384,6 +384,7 @@ class ChromaBackend(BaseSamplerBackend):
             _et_patched    = False   # True if we monkey-patched encode_text
             _et_save_file  = None   # cache file path on miss (save after success)
             _et_captured   = [None] # [0] filled by miss wrapper
+            _te_to_orig    = None   # original text_encoder_to (patched on cache hit)
 
             if cfg.get("text_cache_enabled", False):
                 _cache_dir = (cfg.get("quant_cache_dir", "") or "").strip()
@@ -402,7 +403,8 @@ class ChromaBackend(BaseSamplerBackend):
                 _train_dev     = self.train_device
 
                 if os.path.isfile(_te_cache_file):
-                    # Cache hit — return the two saved tensors, skip TE entirely
+                    # Cache hit — return the two saved tensors, skip TE entirely.
+                    # Also no-op text_encoder_to so T5 is never moved to GPU VRAM.
                     try:
                         _cached = torch.load(
                             _te_cache_file, map_location="cpu", weights_only=True)
@@ -411,13 +413,15 @@ class ChromaBackend(BaseSamplerBackend):
                         _emb_cpu  = _cached["embedding"]
                         _mask_cpu = _cached["mask"]
 
-                        _et_orig = self.model.encode_text
+                        _et_orig    = self.model.encode_text
+                        _te_to_orig = self.model.text_encoder_to
                         def _et_hit(*args, **kwargs):
                             dev = kwargs.get("train_device", _train_dev)
                             return (_emb_cpu.to(dev), _mask_cpu.to(dev))
-                        self.model.encode_text = _et_hit
+                        self.model.encode_text      = _et_hit
+                        self.model.text_encoder_to  = lambda *a, **kw: None
                         _et_patched = True
-                        print(f"[T5 cache] hit  {_te_key}")
+                        print(f"[T5 cache] hit  {_te_key}  (T5 stays off-GPU)")
                     except Exception as _cache_exc:
                         print(f"[T5 cache] load failed ({_cache_exc}) — re-encoding")
                         try:
@@ -463,6 +467,8 @@ class ChromaBackend(BaseSamplerBackend):
                     _transformer.forward = _orig_tr_fwd
                 if _et_patched:
                     self.model.encode_text = _et_orig
+                if _te_to_orig is not None:
+                    self.model.text_encoder_to = _te_to_orig
 
             # Persist captured embeddings (only reached on clean success)
             if _et_save_file and _et_captured[0] is not None:

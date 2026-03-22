@@ -355,6 +355,7 @@ class BaseSamplerApp(ABC):
         self._queue_tree.configure(yscrollcommand=_qs.set)
         self._queue_tree.pack(side="left", fill="both", expand=True)
         _qs.pack(side="right", fill="y")
+        self._queue_tree.bind("<<TreeviewSelect>>", self._on_queue_select)
 
     # ------------------------------------------------------------------
     def _build_right_panel(self, pad: dict) -> None:
@@ -646,6 +647,16 @@ class BaseSamplerApp(ABC):
             vals[5] = spi_str
             self._queue_tree.item(iid, values=vals)
 
+    def _on_queue_select(self, event=None) -> None:
+        """When a completed queue row is clicked, restore its image and details."""
+        sel = self._queue_tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        job = next((j for j in self._queue if j["iid"] == iid), None)
+        if job and job.get("status") == "Done" and job.get("output_path"):
+            self._update_right_panel(job["output_path"], job.get("cfg"))
+
     def _auto_start_queue(self) -> None:
         """Start the queue loop if idle and a pending job exists.
 
@@ -747,6 +758,7 @@ class BaseSamplerApp(ABC):
                     self._queue_stop_requested = True
                 else:
                     job["status"] = "Done"
+                    job["output_path"] = done_path[0]
                     # Patch the actual rolled seed into the cfg snapshot so
                     # Run Details shows the real seed instead of the default.
                     if done_seed[0] is not None and cfg.get("random_seed"):
