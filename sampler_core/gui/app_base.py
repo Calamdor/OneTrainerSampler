@@ -158,8 +158,8 @@ class BaseSamplerApp(ABC):
         self._prompt_text.insert("1.0", self.cfg.get("prompt", ""))
         Tooltip(self._prompt_text,
                 "Positive prompt — describe what you want in the image.\n\n"
-                "T5 token limit: 512 tokens (counter shown to the right).\n"
-                "Text beyond 512 tokens is silently truncated.")
+                "T5 token count shown to the right.\n"
+                "There is no hard limit — VRAM is the only constraint.")
 
         self._token_count_var = tk.StringVar(value="")
         self._token_label = ttk.Label(
@@ -168,8 +168,7 @@ class BaseSamplerApp(ABC):
         )
         self._token_label.grid(row=r, column=6, sticky="nw", padx=(0, 6))
         Tooltip(self._token_label,
-                "T5 token count for the positive prompt.\n"
-                "Turns red when over the 512-token limit.\n\n"
+                "T5 token count for the positive prompt.\n\n"
                 "Counted using the loaded model's tokenizer;\n"
                 "falls back to downloading the T5 vocab if no model is loaded.")
 
@@ -819,10 +818,8 @@ class BaseSamplerApp(ABC):
                     from transformers import T5Tokenizer
                     tokenizer = T5Tokenizer.from_pretrained("google/t5-v1_1-xxl")
                 count = len(tokenizer(prompt, truncation=False).input_ids)
-                limit = 512
-                color = "#cc3333" if count > limit else "gray"
-                self.root.after(0, self._token_count_var.set, f"{count}/{limit} tok")
-                self.root.after(0, self._token_label.config, {"foreground": color})
+                self.root.after(0, self._token_count_var.set, f"{count} tok")
+                self.root.after(0, self._token_label.config, {"foreground": "gray"})
             except Exception:
                 self.root.after(0, self._token_count_var.set, "")
         threading.Thread(target=_count, daemon=True).start()
