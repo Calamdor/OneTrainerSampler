@@ -18,6 +18,7 @@ from sampler_core.util.dtype_maps import (
 from sampler_core.util.gguf_util import gguf_type_summary
 from sampler_core.util.ot_bridge import find_ot_quant_cache
 from sampler_core.util.png_meta import write_png_metadata
+from sampler_core.util.tokenizer_patch import patch_tokenizer_no_truncate
 from sampler_core.util.resolution import ATTN_BACKEND_ENUM_NAME, check_attn_backends
 from sampler_core.lora.hooks import apply_lora_hooks
 from chroma.lora_keys import make_chroma_translator, expand_lora_unet_fused, expand_diffusion_model_fused
@@ -222,6 +223,7 @@ class ChromaBackend(BaseSamplerBackend):
                 raise
 
         self.model = model
+        patch_tokenizer_no_truncate(model)
 
         dtype_label  = f"GGUF [{os.path.basename(transformer_gguf)}]" if is_gguf else weight_dtype_str
         offload_str  = f"offload {fraction:.0%}" if fraction > 0 else "offload off"

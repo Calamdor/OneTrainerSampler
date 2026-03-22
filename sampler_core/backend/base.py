@@ -103,8 +103,10 @@ class BaseSamplerBackend(ABC):
             # counts drop immediately rather than waiting for cyclic GC.
             model = self.model
             self.model = None
-            for _attr in ("transformer", "text_encoder", "vae",
-                          "transformer_offload_conductor"):
+            for _attr in ("transformer", "transformer_2",
+                          "text_encoder", "vae",
+                          "transformer_offload_conductor",
+                          "transformer_2_offload_conductor"):
                 try:
                     delattr(model, _attr)
                 except AttributeError:
