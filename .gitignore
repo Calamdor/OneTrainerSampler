@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# User-specific sampler configs (contain local model paths)
+*_config.json
+
+# Generated images and output
+output/
+
+# Quantization / text-encoder caches
+te_cache/
+*.pt
+*.safetensors
+
+# Claude Code local settings
+.claude/
+
+# VS Code / editor
+.vscode/
+*.swp
+*.swo
+
+# Windows
+Thumbs.db
+Desktop.ini
