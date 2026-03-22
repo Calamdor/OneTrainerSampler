@@ -86,7 +86,7 @@ class ChromaBackend(BaseSamplerBackend):
             summary = gguf_type_summary(transformer_gguf)
             on_status(f"GGUF: {os.path.basename(transformer_gguf)}  [{summary}]")
 
-        _PURE_QUANTIZED = {"NF4", "W4A16", "W8A8", "W8A16", "INT4", "INT8", "GGUF"}
+        _PURE_QUANTIZED = {"NF4", "INT8", "FP8", "W8A8F", "W8A8I", "GGUF"}
         if use_compile and weight_dtype_str in _PURE_QUANTIZED and not svd_enabled:
             on_status(
                 f"⚠ compile enabled but weight dtype is {weight_dtype_str} (quantized) — "

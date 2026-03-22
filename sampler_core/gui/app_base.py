@@ -576,16 +576,14 @@ class BaseSamplerApp(ABC):
         )
 
     def _clear_loras(self) -> None:
+        if self._busy or self._queue_running:
+            return
         self.backend.remove_loras()
         self._lora_status_var.set("LoRAs cleared")
 
     # ==================================================================
     # Shared generate / abort
     # ==================================================================
-
-    def _generate(self) -> None:
-        """Convenience alias — adding to queue is the only way to generate."""
-        self._queue_add()
 
     def _get_total_steps(self, cfg: dict) -> int:
         """Override in subclass if the model uses a non-standard steps key."""
@@ -762,7 +760,7 @@ class BaseSamplerApp(ABC):
                     # Patch the actual rolled seed into the cfg snapshot so
                     # Run Details shows the real seed instead of the default.
                     if done_seed[0] is not None and cfg.get("random_seed"):
-                        cfg = {**cfg, "seed": done_seed[0]}
+                        cfg["seed"] = done_seed[0]   # in-place — job["cfg"] is this dict
                         # Also update the queue tree seed column from "rnd" → actual value
                         _iid = job["iid"]
                         def _update_tree_seed(iid=_iid, s=done_seed[0]):
@@ -810,19 +808,24 @@ class BaseSamplerApp(ABC):
             self._token_count_var.set("")
             self._token_label.config(foreground="gray")
             return
-        try:
-            if self.backend.model is not None and \
-                    getattr(self.backend.model, "tokenizer", None) is not None:
-                tokenizer = self.backend.model.tokenizer
-            else:
-                from transformers import T5Tokenizer
-                tokenizer = T5Tokenizer.from_pretrained("google/t5-v1_1-xxl")
-            count = len(tokenizer(prompt, truncation=False).input_ids)
-            limit = 512
-            self._token_count_var.set(f"{count}/{limit} tok")
-            self._token_label.config(foreground="#cc3333" if count > limit else "gray")
-        except Exception:
-            self._token_count_var.set("")
+        # Run tokenizer lookup off the main thread — from_pretrained can block on
+        # disk/network I/O (HF hub download on first use without a loaded model).
+        def _count():
+            try:
+                if self.backend.model is not None and \
+                        getattr(self.backend.model, "tokenizer", None) is not None:
+                    tokenizer = self.backend.model.tokenizer
+                else:
+                    from transformers import T5Tokenizer
+                    tokenizer = T5Tokenizer.from_pretrained("google/t5-v1_1-xxl")
+                count = len(tokenizer(prompt, truncation=False).input_ids)
+                limit = 512
+                color = "#cc3333" if count > limit else "gray"
+                self.root.after(0, self._token_count_var.set, f"{count}/{limit} tok")
+                self.root.after(0, self._token_label.config, {"foreground": color})
+            except Exception:
+                self.root.after(0, self._token_count_var.set, "")
+        threading.Thread(target=_count, daemon=True).start()
 
     # ==================================================================
     # Shared misc handlers

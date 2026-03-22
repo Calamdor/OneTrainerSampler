@@ -85,6 +85,7 @@ class OneTrainerLauncher:
 
         if self._current_app is not None:
             self._current_app.cleanup()
+            self._current_app.backend.unload_model()
         self._save_last_model(new_name)
         self._build_model_ui(new_name)
 
