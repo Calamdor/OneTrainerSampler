@@ -20,12 +20,12 @@ from sampler_core.gui.theme import apply_dark_theme, BG, FG, BLUE
 
 _SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
 _SAMPLERS_DIR    = os.path.normpath(os.path.join(_SCRIPT_DIR, "..", ".."))
-_LAUNCHER_CFG    = os.path.join(_SAMPLERS_DIR, "sampler_launcher_config.json")
+_LAUNCHER_CFG    = os.path.join(_SAMPLERS_DIR, "config", "sampler_launcher_config.json")
 
 # Ordered list of available models shown in the dropdown.
 _MODELS = [
     "Chroma",
-    # "Wan 2.2 T2V-A14B",   # uncomment when wan/gui.py is ready
+    "Wan 2.2 T2V-A14B",
 ]
 
 
@@ -103,11 +103,11 @@ class OneTrainerLauncher:
             self._current_app = ChromaSamplerApp(self.root,
                                                  container=self._content_frame)
 
-        # elif model_name == "Wan 2.2 T2V-A14B":
-        #     import sampler_core  # noqa: F401
-        #     from wan.gui import WanSamplerApp
-        #     self._current_app = WanSamplerApp(self.root,
-        #                                       container=self._content_frame)
+        elif model_name == "Wan 2.2 T2V-A14B":
+            import sampler_core  # noqa: F401
+            from wan.gui import WanSamplerApp
+            self._current_app = WanSamplerApp(self.root,
+                                              container=self._content_frame)
 
         else:
             ttk.Label(

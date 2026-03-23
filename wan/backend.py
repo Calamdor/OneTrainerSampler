@@ -1,4 +1,4 @@
-"""ChromaBackend — Chroma (CHROMA_1) sampler backend.
+"""WanBackend — Wan2.2 T2V-A14B sampler backend.
 
 Implements BaseSamplerBackend.  load_model() reads all settings from the cfg
 dict so the GUI can pass a plain snapshot without keyword explosion.
@@ -17,21 +17,22 @@ from sampler_core.util.dtype_maps import (
 )
 from sampler_core.util.gguf_util import gguf_type_summary
 from sampler_core.util.ot_bridge import find_ot_quant_cache
-from sampler_core.util.png_meta import write_png_metadata
+from sampler_core.util.png_meta import write_png_metadata, write_png_sidecar
 from sampler_core.util.tokenizer_patch import patch_tokenizer_no_truncate
 from sampler_core.util.resolution import ATTN_BACKEND_ENUM_NAME, check_attn_backends
 from sampler_core.lora.hooks import apply_lora_hooks
-from chroma.lora_keys import make_chroma_translator, expand_lora_unet_fused, expand_diffusion_model_fused
+from wan.lora_keys import make_wan_translator, _detect_expert_from_filename
 
-from modules.model.ChromaModel import ChromaModel
-from modules.modelLoader.chroma.ChromaModelLoader import ChromaModelLoader
-from modules.modelSampler.ChromaSampler import ChromaSampler
-from modules.util.checkpointing_util import enable_checkpointing_for_chroma_transformer
+from modules.model.WanModel import WanModel
+from modules.modelLoader.wan.WanModelLoader import WanModelLoader
+from modules.modelSampler.WanSampler import WanSampler
+from modules.util.checkpointing_util import enable_checkpointing_for_wan_transformer
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.enum.DataType import DataType
 from modules.util.enum.GradientCheckpointingMethod import GradientCheckpointingMethod
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.ImageFormat import ImageFormat
+from modules.util.enum.VideoFormat import VideoFormat
 from modules.util.ModelNames import ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
 from modules.util.quantization_util import quantize_layers as _ot_quantize_layers
@@ -49,29 +50,28 @@ def _te_cache_key(pos_prompt: str, neg_prompt: str, te_dtype: str) -> str:
 class _OffloadConfig:
     """Minimal duck-type for OT's LayerOffloadConductor constructor."""
     def __init__(self, train_device, temp_device, fraction, use_compile=False):
-        self.train_device                = str(train_device)
-        self.temp_device                 = str(temp_device)
-        self.layer_offload_fraction      = float(fraction)
-        self.gradient_checkpointing      = GradientCheckpointingMethod.CPU_OFFLOADED
+        self.train_device                 = str(train_device)
+        self.temp_device                  = str(temp_device)
+        self.layer_offload_fraction       = float(fraction)
+        self.gradient_checkpointing       = GradientCheckpointingMethod.CPU_OFFLOADED
         self.enable_activation_offloading = False
-        self.enable_async_offloading     = True
-        self.compile                     = use_compile
+        self.enable_async_offloading      = True
+        self.compile                      = use_compile
 
 
-class ChromaBackend(BaseSamplerBackend):
-    """Sampler backend for Chroma (CHROMA_1)."""
+class WanBackend(BaseSamplerBackend):
+    """Sampler backend for Wan2.2 T2V-A14B."""
 
     MODEL_IDENTITY_KEYS = (
-        "base_model", "weight_dtype", "text_enc_dtype",
-        "svd_enabled", "svd_rank", "svd_dtype", "transformer_gguf",
-        "quant_cache_dir", "use_compile", "compute_dtype",
-        "fast_fp16_accum", "offload_enabled", "offload_fraction",
+        "base_model_path", "weight_dtype", "text_enc_dtype",
+        "svd_enabled", "svd_rank", "svd_dtype",
+        "transformer_1_gguf", "transformer_2_gguf", "quant_cache_dir",
+        "use_compile", "compute_dtype", "fast_fp16_accum",
+        "offload_enabled", "offload_fraction",
     )
 
     # ------------------------------------------------------------------
     def load_model(self, cfg: dict, on_status) -> None:
-        # Unload any currently loaded model first so we never hold two copies
-        # in RAM simultaneously (old model must be released before new one loads).
         if self.model is not None:
             self.unload_model(on_status)
 
@@ -84,20 +84,27 @@ class ChromaBackend(BaseSamplerBackend):
         use_compile           = cfg.get("use_compile", False)
         offload_enabled       = cfg.get("offload_enabled", False)
         offload_fraction      = cfg.get("offload_fraction", 50)
-        transformer_gguf      = cfg.get("transformer_gguf", "") or ""
+        transformer_1_gguf    = cfg.get("transformer_1_gguf", "") or ""
+        transformer_2_gguf    = cfg.get("transformer_2_gguf", "") or ""
         compute_dtype_override = cfg.get("compute_dtype", "Auto")
         fast_fp16_accum       = cfg.get("fast_fp16_accum", False)
-        base_model_path       = cfg.get("base_model", "")
+        base_model_path       = cfg.get("base_model_path", "")
 
         on_status("Loading model …")
 
-        if weight_dtype_str == "GGUF":
-            if not os.path.isfile(transformer_gguf):
-                raise ValueError("Transformer GGUF path not set or file not found")
+        if weight_dtype_str in {"GGUF", "GGUF_A8I", "GGUF_A8F"}:
+            if not os.path.isfile(transformer_1_gguf):
+                raise ValueError("Transformer 1 GGUF path not set or file not found")
+            if not os.path.isfile(transformer_2_gguf):
+                raise ValueError("Transformer 2 GGUF path not set or file not found")
             if svd_enabled:
                 raise ValueError("SVDQuant is incompatible with GGUF — uncheck SVDQuant first")
-            summary = gguf_type_summary(transformer_gguf)
-            on_status(f"GGUF: {os.path.basename(transformer_gguf)}  [{summary}]")
+            t1_summary = gguf_type_summary(transformer_1_gguf)
+            t2_summary = gguf_type_summary(transformer_2_gguf)
+            on_status(
+                f"GGUF T1: {os.path.basename(transformer_1_gguf)}  [{t1_summary}]\n"
+                f"GGUF T2: {os.path.basename(transformer_2_gguf)}  [{t2_summary}]"
+            )
 
         _PURE_QUANTIZED = {"NF4", "INT8", "FP8", "W8A8F", "W8A8I"}
         if use_compile and weight_dtype_str in _PURE_QUANTIZED and not svd_enabled:
@@ -168,68 +175,68 @@ class ChromaBackend(BaseSamplerBackend):
         is_gguf = weight_dtype_str in {"GGUF", "GGUF_A8I", "GGUF_A8F"}
         model_names = ModelNames(
             base_model=base_model_path,
-            transformer_model=transformer_gguf if is_gguf else "",
+            transformer_model=transformer_1_gguf if is_gguf else "",
+            transformer_2_model=transformer_2_gguf if is_gguf else "",
         )
 
-        model  = ChromaModel(ModelType.CHROMA_1)
-        loader = ChromaModelLoader()
-        loader.load(model, ModelType.CHROMA_1, model_names, weight_dtypes, quantization)
+        model  = WanModel(ModelType.WAN2_2_T2V)
+        loader = WanModelLoader()
+        loader.load(model, ModelType.WAN2_2_T2V, model_names, weight_dtypes, quantization)
 
         # For GGUF_A8I/F: the loader already replaced GGUFLinear → LinearGGUFA8 internally.
         # quantize_layers sets compute_dtype on those layers (left None by the factory).
-        # It does NOT call .quantize() for non-QuantizedModuleMixin modules.
         if weight_dtype_str in {"GGUF_A8I", "GGUF_A8F"}:
-            _ot_quantize_layers(model.transformer, self.train_device, compute_dtype, None)
+            _ot_quantize_layers(model.transformer,   self.train_device, compute_dtype, None)
+            _ot_quantize_layers(model.transformer_2, self.train_device, compute_dtype, None)
 
-        # Quantize transformer layer-by-layer with status updates
+        # Quantize each transformer layer-by-layer with progress updates.
+        # Two experts (T1 = HIGH-noise, T2 = LOW-noise) are quantized separately.
         if weight_dtype.is_quantized():
             from modules.module.quantized.mixin.QuantizedModuleMixin import QuantizedModuleMixin as _QMM
-            quant_layers = [(n, m) for n, m in model.transformer.named_modules()
-                            if isinstance(m, _QMM)]
-            total_q = len(quant_layers)
-            for idx, (name, child) in enumerate(quant_layers):
-                child.compute_dtype = compute_dtype.torch_dtype()
-                label = name.rsplit(".", 1)[-1] if "." in name else name
-                if svd_enabled:
-                    on_status(f"SVDQuant {idx + 1}/{total_q}: {label} …")
-                elif idx % 20 == 0:
-                    on_status(f"Quantizing transformer {idx + 1}/{total_q} …")
-                child.quantize(device=self.train_device)
-            on_status(f"Transformer quantization done ({total_q} layers).")
+            for _xfmr_label, _xfmr in (("T1", model.transformer), ("T2", model.transformer_2)):
+                _quant_layers = [(n, m) for n, m in _xfmr.named_modules()
+                                 if isinstance(m, _QMM)]
+                _total_q = len(_quant_layers)
+                for _idx, (_name, _child) in enumerate(_quant_layers):
+                    _child.compute_dtype = compute_dtype.torch_dtype()
+                    _lbl = _name.rsplit(".", 1)[-1] if "." in _name else _name
+                    if svd_enabled:
+                        on_status(f"SVDQuant {_xfmr_label} {_idx + 1}/{_total_q}: {_lbl} …")
+                    elif _idx % 20 == 0:
+                        on_status(f"Quantizing {_xfmr_label} {_idx + 1}/{_total_q} …")
+                    _child.quantize(device=self.train_device)
+                on_status(f"{_xfmr_label} quantization done ({_total_q} layers).")
         if te_dtype.is_quantized():
             on_status("Finalizing quantized text encoder weights …")
-            _ot_quantize_layers(model.text_encoder, self.train_device, compute_dtype, None)
+            _ot_quantize_layers(model.text_encoder,  self.train_device, compute_dtype, None)
 
         fraction = max(0.0, min(0.99, offload_fraction / 100.0)) if offload_enabled else 0.0
         if fraction > 0:
-            # Offload + optional compile: let OT's checkpointing system handle
-            # per-block compile with fullgraph=True.  When use_compile=True,
-            # create_checkpoint() calls orig_module.compile(fullgraph=True) on
-            # each inner block and leaves the OffloadCheckpointLayer wrapper
-            # uncompiled (offloading logic cannot be in a compiled graph).
             if use_compile:
                 on_status(f"Setting up layer offload ({fraction:.0%}) + compiling blocks …")
             else:
                 on_status(f"Setting up layer offload ({fraction:.0%}) …")
+            # Pass use_compile through so OT's checkpointing wraps each block in
+            # OffloadCheckpointLayer and calls orig_module.compile(fullgraph=True).
+            # Same approach as Chroma; the LoRA+compile guard in sample() swaps
+            # compiled inner blocks to eager when LoRAs are active.
             oc = _OffloadConfig(self.train_device, self.temp_device, fraction,
                                 use_compile=use_compile)
             model.transformer_offload_conductor = \
-                enable_checkpointing_for_chroma_transformer(model.transformer, oc)
+                enable_checkpointing_for_wan_transformer(model.transformer, oc)
+            model.transformer_2_offload_conductor = \
+                enable_checkpointing_for_wan_transformer(model.transformer_2, oc)
         elif use_compile:
-            # No offload: compile each block independently.
-            # fullgraph=True is NOT used here so that forward hooks (LoRA) can
-            # fire as graph breaks — the large matmuls between hook call-sites
-            # still compile.  fullgraph=True would silently bypass hooks and
-            # force all LoRA samples into pure eager mode.
+            # No offload: compile each block independently without fullgraph=True so
+            # that forward hooks (LoRA) can fire as graph breaks.
             on_status("Compiling transformer blocks …")
-            for blk_list in (model.transformer.transformer_blocks,
-                             model.transformer.single_transformer_blocks):
-                for i in range(len(blk_list)):
-                    blk_list[i] = torch.compile(blk_list[i], dynamic=True)
+            for xfmr in (model.transformer, model.transformer_2):
+                for i in range(len(xfmr.blocks)):
+                    xfmr.blocks[i] = torch.compile(xfmr.blocks[i], dynamic=True)
 
         model.autocast_context             = torch.autocast("cuda", dtype=torch_compute)
-        model.text_encoder_autocast_context = torch.autocast("cuda", dtype=torch_compute)
-        model.train_dtype                  = compute_dtype
+        model.transformer_autocast_context = torch.autocast("cuda", dtype=torch_compute)
+        model.transformer_train_dtype      = compute_dtype
 
         model.eval()
         model.vae_to(self.temp_device)
@@ -244,26 +251,41 @@ class ChromaBackend(BaseSamplerBackend):
         self._loaded_cfg = cfg
         patch_tokenizer_no_truncate(model)
 
-        dtype_label  = f"GGUF [{os.path.basename(transformer_gguf)}]" if is_gguf else weight_dtype_str
+        if is_gguf:
+            dtype_label = (
+                f"GGUF [{os.path.basename(transformer_1_gguf)} / "
+                f"{os.path.basename(transformer_2_gguf)}]"
+            )
+        else:
+            dtype_label = weight_dtype_str
         offload_str  = f"offload {fraction:.0%}" if fraction > 0 else "offload off"
-        compile_note = ("  compile:per-block" if use_compile else "")
+        compile_note = "  compile:on" if use_compile else ""
         on_status(f"Loaded [{dtype_label}]  |  {offload_str}{compile_note}")
 
     # ------------------------------------------------------------------
     def _inject_lora(self, state_dict: dict, weight: float, entry: dict) -> list:
-        state_dict = expand_lora_unet_fused(state_dict)
-        state_dict = expand_diffusion_model_fused(state_dict)
-        translator = make_chroma_translator(self.model.transformer, self.model.text_encoder)
+        expert = entry.get("expert", "BOTH")
+        if expert == "AUTO":
+            expert = _detect_expert_from_filename(entry.get("path", ""))
+
+        hooks  = []
         on_log = getattr(self, "_on_log", None)
-        return apply_lora_hooks(
-            self.model.transformer,
-            self.model.text_encoder,
-            state_dict,
-            weight,
-            translator,
-            on_log=on_log,
-            hint_device=self.train_device,
-        )
+
+        if expert in ("HIGH", "BOTH") and self.model.transformer is not None:
+            hooks += apply_lora_hooks(
+                self.model.transformer, None, state_dict, weight,
+                make_wan_translator(self.model.transformer),
+                on_log=on_log,
+                hint_device=self.train_device,
+            )
+        if expert in ("LOW", "BOTH") and self.model.transformer_2 is not None:
+            hooks += apply_lora_hooks(
+                self.model.transformer_2, None, state_dict, weight,
+                make_wan_translator(self.model.transformer_2),
+                on_log=on_log,
+                hint_device=self.train_device,
+            )
+        return hooks
 
     # ------------------------------------------------------------------
     def sample(self, cfg: dict, on_progress, on_done, on_error) -> None:
@@ -287,6 +309,9 @@ class ChromaBackend(BaseSamplerBackend):
                 }
                 on_error(f"{attn_str} is not installed.\n{_install.get(attn_str, '')}")
                 return
+            if attn_str == "SageAttn":
+                print("[WanSampler] NOTE: SageAttention may produce artifacts on Wan2.2 "
+                      "(Q/K int8 overflow). If output looks wrong, switch to Auto.")
 
         self._cancel_event.clear()
 
@@ -299,24 +324,23 @@ class ChromaBackend(BaseSamplerBackend):
         ts       = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         out_base = os.path.join(cfg["output_dir"], f"{ts}-sample-{seed}")
 
-        try:
-            sample_config = SampleConfig.default_values(ModelType.CHROMA_1)
-        except TypeError:
-            sample_config = SampleConfig.default_values()
+        sample_config                  = SampleConfig.default_values(ModelType.WAN2_2_T2V)
         sample_config.prompt           = cfg.get("prompt", "")
         sample_config.negative_prompt  = cfg.get("negative_prompt", "")
-        sample_config.width            = int(cfg.get("width", 1024))
-        sample_config.height           = int(cfg.get("height", 1024))
-        sample_config.cfg_scale        = float(cfg.get("cfg_scale", 3.5))
+        sample_config.width            = int(cfg.get("width", 848))
+        sample_config.height           = int(cfg.get("height", 480))
+        sample_config.frames           = int(cfg.get("frames", 81))
+        sample_config.cfg_scale        = float(cfg.get("cfg_scale", 5.0))
+        sample_config.cfg_scale_2      = float(cfg.get("cfg_scale_2", 5.0))
         sample_config.seed             = seed
         sample_config.random_seed      = False
-        sample_config.diffusion_steps  = int(cfg.get("steps", 30))
+        sample_config.steps_high       = int(cfg.get("steps_high", 20))
+        sample_config.steps_low        = int(cfg.get("steps_low", 0))
+        sample_config.diffusion_steps  = sample_config.steps_high + sample_config.steps_low
 
         scheduler_type = cfg.get("scheduler", "Euler")
-        sigma_shift    = float(cfg.get("sigma_shift", 3.0))
-
-        cancel_event  = self._cancel_event
-        _heun_sched   = (scheduler_type == "Heun")
+        _heun_sched    = (scheduler_type == "Heun")
+        cancel_event   = self._cancel_event
 
         def _progress(step, total):
             if cancel_event.is_set():
@@ -327,6 +351,7 @@ class ChromaBackend(BaseSamplerBackend):
             else:
                 on_progress(step, total)
 
+        _compiled_blocks = []
         try:
             _enum_name = ATTN_BACKEND_ENUM_NAME.get(attn_str)
             from diffusers.models.attention_dispatch import (
@@ -340,73 +365,46 @@ class ChromaBackend(BaseSamplerBackend):
             )
 
             # ---- scheduler swap ------------------------------------------
+            # Wan2.2 calculates sigma shift automatically from the model config;
+            # we preserve the original shift and only swap the scheduler class.
             _orig_scheduler = self.model.noise_scheduler
-            _base_cfg = dict(_orig_scheduler.config)
-            _model_shift = float(_base_cfg.get("shift", 3.0))
-            _use_shift   = sigma_shift if abs(sigma_shift - _model_shift) > 1e-4 else _model_shift
-
             if scheduler_type == "Heun":
                 from diffusers import FlowMatchHeunDiscreteScheduler
+                _base_cfg = dict(_orig_scheduler.config)
                 self.model.noise_scheduler = FlowMatchHeunDiscreteScheduler(
                     num_train_timesteps=_base_cfg.get("num_train_timesteps", 1000),
-                    shift=_use_shift,
+                    shift=_base_cfg.get("shift", 1.0),
                 )
-            elif abs(_use_shift - _model_shift) > 1e-4:
-                # Euler with overridden shift — rebuild from existing config
-                from diffusers import FlowMatchEulerDiscreteScheduler
-                self.model.noise_scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-                    {**_base_cfg, "shift": _use_shift}
-                )
-            # else: Euler + same shift — keep model scheduler as-is
+            # Euler: keep existing scheduler (no shift override for Wan)
             # --------------------------------------------------------------
 
-            # ---- LoRA + compile guard fix (offload only) -----------------
-            # No-offload blocks are compiled WITHOUT fullgraph=True, so forward
-            # hooks fire as graph breaks — no swap needed, LoRAs work at
-            # compiled speed.
-            #
-            # Offload blocks use OT's create_checkpoint() which compiles the
-            # inner block with fullgraph=True (hooks silently bypassed there).
-            # Swap those inner blocks to _orig_mod so hooks fire in eager.
-            _compiled_blocks = []
+            # ---- LoRA + compile guard (offload only) ---------------------
+            # When offload + compile is active OT wraps each block with
+            # orig_module.compile(fullgraph=True).  fullgraph silently bypasses
+            # forward hooks (LoRA).  Swap those inner compiled blocks to their
+            # _orig_mod so hooks fire in eager; restore after sampling.
             _opt_cls = getattr(torch._dynamo, "OptimizedModule", None)
             if self.lora_hooks and _opt_cls is not None:
-                for blk_list in (self.model.transformer.transformer_blocks,
-                                 self.model.transformer.single_transformer_blocks):
-                    for i in range(len(blk_list)):
-                        blk = blk_list[i]
+                for xfmr in (self.model.transformer, self.model.transformer_2):
+                    for blk in xfmr.blocks:
                         if hasattr(blk, "checkpoint") and isinstance(blk.checkpoint, _opt_cls):
-                            # offload + compile: swap inner fullgraph block to eager
-                            _compiled_blocks.append(("checkpoint", blk, blk.checkpoint))
+                            _compiled_blocks.append((blk, blk.checkpoint))
                             blk.checkpoint = blk.checkpoint._orig_mod
                 if _compiled_blocks:
                     print(f"[compile] LoRAs + offload — {len(_compiled_blocks)} inner blocks "
                           "in eager mode (fullgraph bypass)")
             # --------------------------------------------------------------
 
-            sampler = ChromaSampler(
-                self.train_device, self.temp_device,
-                self.model, ModelType.CHROMA_1,
-            )
-
-            _transformer      = self.model.transformer
-            _needs_mask_patch = attn_str in ("Flash", "SageAttn")
-            if _needs_mask_patch:
-                _orig_tr_fwd = _transformer.forward
-                def _fwd_no_attn_mask(*args, **kwargs):
-                    kwargs.pop("attention_mask", None)
-                    return _orig_tr_fwd(*args, **kwargs)
-                _transformer.forward = _fwd_no_attn_mask
-
-            # ---- text-encoder embedding cache ----------------------------
-            # Patch model.encode_text (not text_encoder.forward) so we cache
-            # the two final tensors it returns — (embedding, mask) — rather
-            # than the intermediate BaseModelOutput whose hidden_states tuple
-            # contains CPU tensors that cause a device mismatch on replay.
-            _et_patched    = False   # True if we monkey-patched encode_text
-            _et_save_file  = None   # cache file path on miss (save after success)
-            _et_captured   = [None] # [0] filled by miss wrapper
-            _te_to_orig    = None   # original text_encoder_to (patched on cache hit)
+            # ---- UMT5 embedding cache ------------------------------------
+            # WanSampler calls encode_text TWICE per generation: once for the
+            # positive prompt, once for the negative.  Cache stores both results
+            # (emb0/mask0 = positive, emb1/mask1 = negative) so neither T5 call
+            # is needed on a cache hit.
+            _et_patched   = False
+            _et_save_file = None
+            _et_captured  = [None, None]
+            _te_to_orig   = None
+            _et_orig      = self.model.encode_text  # ref for restore in finally
 
             if cfg.get("text_cache_enabled", False):
                 _cache_dir = (cfg.get("quant_cache_dir", "") or "").strip()
@@ -425,110 +423,149 @@ class ChromaBackend(BaseSamplerBackend):
                 _train_dev     = self.train_device
 
                 if os.path.isfile(_te_cache_file):
-                    # Cache hit — return the two saved tensors, skip TE entirely.
-                    # Also no-op text_encoder_to so T5 is never moved to GPU VRAM.
+                    # Cache hit — return saved tensors in call order (0=pos, 1=neg).
+                    # No-op text_encoder_to so T5 never consumes VRAM.
                     try:
                         _cached = torch.load(
                             _te_cache_file, map_location="cpu", weights_only=True)
-                        if not isinstance(_cached, dict) or "embedding" not in _cached:
+                        if not isinstance(_cached, dict) or "emb0" not in _cached:
                             raise ValueError("stale cache format")
-                        _emb_cpu  = _cached["embedding"]
-                        _mask_cpu = _cached["mask"]
-
-                        _et_orig    = self.model.encode_text
-                        _te_to_orig = self.model.text_encoder_to
+                        _hit_idx = [0]
                         def _et_hit(*args, **kwargs):
-                            dev = kwargs.get("train_device", _train_dev)
-                            return (_emb_cpu.to(dev), _mask_cpu.to(dev))
-                        self.model.encode_text      = _et_hit
-                        self.model.text_encoder_to  = lambda *a, **kw: None
+                            dev = args[1] if len(args) > 1 else _train_dev
+                            _i  = _hit_idx[0]
+                            _hit_idx[0] += 1
+                            _ek, _mk = f"emb{_i}", f"mask{_i}"
+                            if _ek not in _cached:
+                                # Fallback: cfg changed since cache was written
+                                return _et_orig(*args, **kwargs)
+                            return (_cached[_ek].to(dev), _cached[_mk].to(dev))
+                        _te_to_orig                = self.model.text_encoder_to
+                        self.model.encode_text     = _et_hit
+                        self.model.text_encoder_to = lambda *a, **kw: None
                         _et_patched = True
-                        print(f"[T5 cache] hit  {_te_key}  (T5 stays off-GPU)")
+                        print(f"[UMT5 cache] hit  {_te_key}  (T5 stays off-GPU)")
                     except Exception as _cache_exc:
-                        print(f"[T5 cache] load failed ({_cache_exc}) — re-encoding")
+                        print(f"[UMT5 cache] load failed ({_cache_exc}) — re-encoding")
                         try:
                             os.remove(_te_cache_file)
                         except OSError:
                             pass
-
                 else:
-                    # Cache miss — wrap encode_text to capture outputs, save after success
+                    # Cache miss — wrap to capture both encode_text calls
                     os.makedirs(_te_cache_dir, exist_ok=True)
-                    _et_orig = self.model.encode_text
+                    _call_idx = [0]
                     def _et_miss(*args, **kwargs):
                         result = _et_orig(*args, **kwargs)
-                        _et_captured[0] = (result[0].detach().cpu(),
-                                           result[1].detach().cpu())
+                        _i = _call_idx[0]
+                        _call_idx[0] += 1
+                        if _i < 2:
+                            _et_captured[_i] = (result[0].detach().cpu(),
+                                                result[1].detach().cpu())
                         return result
                     self.model.encode_text = _et_miss
                     _et_patched   = True
                     _et_save_file = _te_cache_file
-                    print(f"[T5 cache] miss {_te_key} — encoding and saving")
+                    print(f"[UMT5 cache] miss {_te_key} — encoding and saving")
             # --------------------------------------------------------------
 
-            # Suppress ChromaSampler's tqdm console output — we have the GUI bar.
-            import modules.modelSampler.ChromaSampler as _cs_mod
+            is_image = (sample_config.frames == 1)
+            sampler  = WanSampler(
+                self.train_device, self.temp_device,
+                self.model, ModelType.WAN2_2_T2V,
+            )
+
+            # Suppress WanSampler's tqdm console output — GUI progress bar handles it.
+            import modules.modelSampler.WanSampler as _ws_mod
             import tqdm as _tqdm_lib
-            _orig_cs_tqdm = _cs_mod.tqdm
-            _cs_mod.tqdm = lambda *a, **kw: _tqdm_lib.tqdm(*a, **{**kw, "disable": True})
+            _orig_ws_tqdm = _ws_mod.tqdm
+            _ws_mod.tqdm = lambda *a, **kw: _tqdm_lib.tqdm(*a, **{**kw, "disable": True})
 
             try:
-                with _ctx:
-                    sampler.sample(
-                        sample_config=sample_config,
-                        destination=out_base,
-                        image_format=ImageFormat.PNG,
-                        on_update_progress=_progress,
-                    )
+                if is_image:
+                    with _ctx:
+                        sampler.sample(
+                            sample_config=sample_config,
+                            destination=out_base,
+                            image_format=ImageFormat.PNG,
+                            video_format=None,
+                            on_update_progress=_progress,
+                        )
+                else:
+                    with _ctx:
+                        sampler.sample(
+                            sample_config=sample_config,
+                            destination=out_base,
+                            image_format=None,
+                            video_format=VideoFormat.MP4,
+                            on_update_progress=_progress,
+                        )
             finally:
-                _cs_mod.tqdm = _orig_cs_tqdm
+                _ws_mod.tqdm = _orig_ws_tqdm
                 self.model.noise_scheduler = _orig_scheduler
-                for _, _blk, _compiled_inner in _compiled_blocks:
+                for _blk, _compiled_inner in _compiled_blocks:
                     _blk.checkpoint = _compiled_inner
-                if _needs_mask_patch:
-                    _transformer.forward = _orig_tr_fwd
                 if _et_patched:
                     self.model.encode_text = _et_orig
                 if _te_to_orig is not None:
                     self.model.text_encoder_to = _te_to_orig
 
             # Persist captured embeddings (only reached on clean success)
-            if _et_save_file and _et_captured[0] is not None:
-                _emb, _mask = _et_captured[0]
-                torch.save({"embedding": _emb, "mask": _mask}, _et_save_file)
-                print(f"[T5 cache] saved → {os.path.basename(_et_save_file)}")
+            if _et_save_file and any(c is not None for c in _et_captured):
+                _save_dict = {}
+                for _i, _cap in enumerate(_et_captured):
+                    if _cap is not None:
+                        _save_dict[f"emb{_i}"]  = _cap[0]
+                        _save_dict[f"mask{_i}"] = _cap[1]
+                if _save_dict:
+                    torch.save(_save_dict, _et_save_file)
+                    print(f"[UMT5 cache] saved → {os.path.basename(_et_save_file)}")
 
-            out_path = out_base + ImageFormat.PNG.extension()
+            out_path = (out_base + ImageFormat.PNG.extension() if is_image
+                        else out_base + VideoFormat.MP4.extension())
+
             lora_entries = [
-                {"path": e.get("path", ""), "weight": e.get("weight", 1.0)}
+                {
+                    "path":   e.get("path", ""),
+                    "weight": e.get("weight", 1.0),
+                    "expert": e.get("expert", "BOTH"),
+                }
                 for e in cfg.get("loras", [])
                 if e.get("enabled", True) and e.get("path", "").strip()
             ]
             meta = {
-                "model":            cfg.get("base_model", ""),
-                "transformer_gguf": cfg.get("transformer_gguf") or None,
-                "weight_dtype":     cfg.get("weight_dtype", ""),
-                "text_enc_dtype":   cfg.get("text_enc_dtype", ""),
-                "compute_dtype":    cfg.get("compute_dtype", "Auto"),
-                "svd_enabled":      cfg.get("svd_enabled", False),
-                "svd_rank":         cfg.get("svd_rank", 16) if cfg.get("svd_enabled") else None,
-                "svd_dtype":        cfg.get("svd_dtype", "BF16") if cfg.get("svd_enabled") else None,
-                "prompt":           cfg.get("prompt", ""),
-                "negative_prompt":  cfg.get("negative_prompt", ""),
-                "seed":             seed,
-                "scheduler":        scheduler_type,
-                "sigma_shift":      _use_shift,
-                "steps":            cfg.get("steps", 30),
-                "cfg_scale":        cfg.get("cfg_scale", 3.5),
-                "width":            cfg.get("width", 1024),
-                "height":           cfg.get("height", 1024),
-                "pixel_target":     cfg.get("pixel_target", 1024),
-                "aspect_ratio":     cfg.get("aspect_ratio", "1:1"),
-                "attn_backend":     attn_str,
-                "loras":            lora_entries,
+                "model":              cfg.get("base_model_path", ""),
+                "transformer_1_gguf": cfg.get("transformer_1_gguf") or None,
+                "transformer_2_gguf": cfg.get("transformer_2_gguf") or None,
+                "weight_dtype":       cfg.get("weight_dtype", ""),
+                "text_enc_dtype":     cfg.get("text_enc_dtype", ""),
+                "compute_dtype":      cfg.get("compute_dtype", "Auto"),
+                "svd_enabled":        cfg.get("svd_enabled", False),
+                "svd_rank":           cfg.get("svd_rank", 16) if cfg.get("svd_enabled") else None,
+                "svd_dtype":          cfg.get("svd_dtype", "BF16") if cfg.get("svd_enabled") else None,
+                "prompt":             cfg.get("prompt", ""),
+                "negative_prompt":    cfg.get("negative_prompt", ""),
+                "seed":               seed,
+                "scheduler":          scheduler_type,
+                "width":              sample_config.width,
+                "height":             sample_config.height,
+                "pixel_target":       cfg.get("pixel_target", 640),
+                "aspect_ratio":       cfg.get("aspect_ratio", "16:9"),
+                "frames":             sample_config.frames,
+                "steps_high":         sample_config.steps_high,
+                "steps_low":          sample_config.steps_low,
+                "cfg_scale":          sample_config.cfg_scale,
+                "cfg_scale_2":        sample_config.cfg_scale_2,
+                "attn_backend":       attn_str,
+                "loras":              lora_entries,
             }
             meta = {k: v for k, v in meta.items() if v is not None}
-            write_png_metadata(out_path, "chroma_sampler", meta)
+
+            if is_image:
+                write_png_metadata(out_path, "wan_sampler", meta)
+            else:
+                write_png_sidecar(out_path, "wan_sampler", meta)
+
             on_done(out_path, seed)
         except Cancelled:
             on_done(None, None)

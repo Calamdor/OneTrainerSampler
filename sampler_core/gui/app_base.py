@@ -19,12 +19,53 @@ from abc import ABC, abstractmethod
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from tkinter.scrolledtext import ScrolledText
 
 from sampler_core.util.config import load_config, save_config
 from sampler_core.util.ot_bridge import find_ot_workspace, find_ot_quant_cache
 from sampler_core.util.resolution import check_attn_backends
 from sampler_core.gui.tooltip import Tooltip  # noqa: F401 — re-exported for subclasses
 from sampler_core.gui.theme import apply_dark_theme, BG, BG_INPUT, FG, BG_WIDGET, FG_DIM
+
+
+def _load_video_frames(path: str) -> tuple[list, float]:
+    """
+    Decode all frames of an MP4 as PIL Images.  Returns (frames, fps).
+    Tries imageio (ffmpeg plugin) first; falls back to cv2.
+    Called from a background thread — no tkinter calls inside.
+    """
+    from PIL import Image
+
+    # ---- imageio / ffmpeg -----------------------------------------------
+    try:
+        import imageio
+        reader = imageio.get_reader(path, plugin="ffmpeg")
+        fps    = float(reader.get_meta_data().get("fps", 24.0))
+        frames = [Image.fromarray(f) for f in reader]
+        reader.close()
+        if frames:
+            return frames, fps
+    except Exception:
+        pass
+
+    # ---- cv2 fallback ---------------------------------------------------
+    try:
+        import cv2
+        cap    = cv2.VideoCapture(path)
+        fps    = cap.get(cv2.CAP_PROP_FPS) or 24.0
+        frames = []
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+        cap.release()
+        if frames:
+            return frames, float(fps)
+    except Exception:
+        pass
+
+    return [], 24.0
 
 
 class BaseSamplerApp(ABC):
@@ -47,13 +88,24 @@ class BaseSamplerApp(ABC):
 
         self._lora_rows: list[dict] = []
         self._last_output: str | None = None
-        self._busy        = False
         self._blink_id: str | None = None
         self._blink_state = False
+
+        # Session log
+        self._log_lines: list[str] = []
+        self._log_win:  tk.Toplevel | None = None
+        self._log_text: ScrolledText | None = None
 
         self._queue: list[dict] = []
         self._queue_running        = False
         self._queue_stop_requested = False
+
+        # Video player state
+        self._video_frames:    list      = []
+        self._video_frame_idx: int       = 0
+        self._video_fps:       float     = 24.0
+        self._video_playing:   bool      = False
+        self._video_after_id:  str | None = None
 
         self._build_ui()
         self._load_loras_from_config()
@@ -245,19 +297,14 @@ class BaseSamplerApp(ABC):
 
         apply_row = ttk.Frame(lora_frame)
         apply_row.pack(fill="x", pady=2)
-        _apply_btn = ttk.Button(apply_row, text="Apply LoRAs", command=self._apply_loras)
-        _apply_btn.pack(side="left", padx=2)
-        Tooltip(_apply_btn,
-                "Apply all enabled LoRAs to the loaded model as forward hooks.\n\n"
-                "LoRAs stay applied until you click Clear LoRAs or reload the model.\n"
-                "Weight column controls each LoRA's strength (1.0 = full strength).\n\n"
-                "Note: applying LoRAs while torch.compile is active will run inference\n"
-                "in eager mode for that session (avoids a 5-min recompile).")
         _clear_btn = ttk.Button(apply_row, text="Clear LoRAs", command=self._clear_loras)
         _clear_btn.pack(side="left", padx=2)
         Tooltip(_clear_btn, "Remove all applied LoRA hooks from the model.\n"
-                "The model reverts to its base weights. No reload needed.")
+                "The model reverts to its base weights. No reload needed.\n\n"
+                "LoRAs are applied automatically by the queue before each job.")
         self._lora_status_var = tk.StringVar(value="No LoRAs applied")
+        self._lora_status_var.trace_add("write",
+            lambda *_: self._append_log(f"[lora]  {self._lora_status_var.get()}"))
         ttk.Label(apply_row, textvariable=self._lora_status_var,
                   foreground="gray").pack(side="left", padx=8)
 
@@ -293,11 +340,13 @@ class BaseSamplerApp(ABC):
         btn_row = ttk.Frame(queue_frame)
         btn_row.pack(fill="x", pady=(2, 0))
         self._add_queue_btn = ttk.Button(
-            btn_row, text="+ Add to Queue", command=self._queue_add)
+            btn_row, text="＋ Add to Queue", command=self._queue_add,
+            style="Accent.TButton")
         self._add_queue_btn.pack(side="left", padx=2)
         Tooltip(self._add_queue_btn,
                 "Snapshot the current settings and add a job to the queue.\n\n"
-                "The queue starts automatically once the model is loaded.\n"
+                "The model loads automatically when the job runs.\n"
+                "Consecutive jobs with the same model settings skip the reload.\n"
                 "Each job runs with the settings captured at the time it was added,\n"
                 "so you can queue multiple jobs with different prompts/seeds.")
         _remove_btn = ttk.Button(btn_row, text="Remove", command=self._queue_remove_selected)
@@ -308,6 +357,11 @@ class BaseSamplerApp(ABC):
         _clear_btn.pack(side="left", padx=2)
         Tooltip(_clear_btn, "Remove all pending jobs from the queue.\n"
                 "Any currently running job is not affected.")
+        _log_btn = ttk.Button(btn_row, text="Log", command=self._open_log_window)
+        _log_btn.pack(side="right", padx=2)
+        Tooltip(_log_btn, "Open the session log window.\n\n"
+                "Shows all model load, LoRA, and queue status messages\n"
+                "with timestamps. Useful for diagnosing errors.")
 
         # --- progress row ---
         prog_row = ttk.Frame(queue_frame)
@@ -330,6 +384,8 @@ class BaseSamplerApp(ABC):
         ttk.Label(prog_row, textvariable=self._step_label_var,
                   foreground="gray", font=("TkDefaultFont", 8)).pack(side="left", padx=(4, 8))
         self._queue_status_var = tk.StringVar(value="")
+        self._queue_status_var.trace_add("write",
+            lambda *_: self._append_log(f"[queue] {self._queue_status_var.get()}"))
         ttk.Label(prog_row, textvariable=self._queue_status_var,
                   foreground="gray", font=("TkDefaultFont", 8)).pack(side="left")
 
@@ -382,6 +438,30 @@ class BaseSamplerApp(ABC):
         self._preview_photo   = None   # ImageTk reference kept to prevent GC
 
         self._preview_container.bind("<Configure>", self._on_preview_resize)
+
+        # ---- Video player controls (hidden until a video is loaded) ----
+        self._video_ctrl_bar = tk.Frame(preview_frame, background=BG)
+        self._video_ctrl_bar.pack(fill="x", padx=4, pady=(0, 4))
+
+        self._video_play_btn = tk.Button(
+            self._video_ctrl_bar,
+            text="⏸ Pause", width=8,
+            command=self._toggle_video_playback,
+            background="#2a4a6a", foreground="white",
+            activebackground="#3a6a8a", activeforeground="white",
+            relief="flat", padx=4, pady=2,
+        )
+        self._video_play_btn.pack(side="left", padx=(0, 8))
+
+        self._video_frame_label_var = tk.StringVar(value="")
+        tk.Label(
+            self._video_ctrl_bar,
+            textvariable=self._video_frame_label_var,
+            background=BG, foreground=FG_DIM,
+            font=("TkDefaultFont", 8),
+        ).pack(side="left")
+
+        self._video_ctrl_bar.pack_forget()   # shown only for video output
 
         # ---- Run details -------------------------------------------
         details_frame = ttk.LabelFrame(self._right_frame, text="Run Details")
@@ -443,6 +523,8 @@ class BaseSamplerApp(ABC):
         self._preview_resize_id = self.root.after(80, self._redraw_preview)
 
     def _redraw_preview(self) -> None:
+        if self._video_playing and self._video_frames:
+            return   # video tick handles its own redraws
         if self._preview_pil_img is None:
             return
         w = self._preview_container.winfo_width() - 8
@@ -458,15 +540,92 @@ class BaseSamplerApp(ABC):
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # Video playback helpers
+    # ------------------------------------------------------------------
+
+    def _start_video_playback(self, frames: list, fps: float) -> None:
+        """Called on the main thread after background frame loading completes."""
+        if not frames:
+            self._preview_label.config(image="", text="Could not read video")
+            return
+        self._video_frames    = frames
+        self._video_frame_idx = 0
+        self._video_fps       = max(1.0, fps)
+        self._video_playing   = True
+        self._video_play_btn.config(text="⏸ Pause")
+        self._video_tick()
+
+    def _video_tick(self) -> None:
+        """Advance one frame and schedule the next tick."""
+        if not self._video_playing or not self._video_frames:
+            return
+        frame = self._video_frames[self._video_frame_idx]
+        total = len(self._video_frames)
+        w = self._preview_container.winfo_width() - 8
+        h = self._preview_container.winfo_height() - 8
+        if w > 10 and h > 10:
+            try:
+                from PIL import Image, ImageTk
+                img = frame.copy()
+                img.thumbnail((w, h), Image.LANCZOS)
+                self._preview_photo = ImageTk.PhotoImage(img)
+                self._preview_label.config(image=self._preview_photo, text="")
+            except Exception:
+                pass
+        self._video_frame_label_var.set(
+            f"{self._video_frame_idx + 1} / {total}  ({self._video_fps:.1f} fps)")
+        self._video_frame_idx = (self._video_frame_idx + 1) % total
+        delay_ms = max(1, int(1000.0 / self._video_fps))
+        self._video_after_id = self.root.after(delay_ms, self._video_tick)
+
+    def _stop_video_playback(self) -> None:
+        """Cancel animation loop and reset state."""
+        self._video_playing = False
+        if self._video_after_id is not None:
+            self.root.after_cancel(self._video_after_id)
+            self._video_after_id = None
+        self._video_frames    = []
+        self._video_frame_idx = 0
+
+    def _toggle_video_playback(self) -> None:
+        if not self._video_frames:
+            return
+        if self._video_playing:
+            self._video_playing = False
+            if self._video_after_id is not None:
+                self.root.after_cancel(self._video_after_id)
+                self._video_after_id = None
+            self._video_play_btn.config(text="▶ Play")
+        else:
+            self._video_playing = True
+            self._video_play_btn.config(text="⏸ Pause")
+            self._video_tick()
+
     def _update_right_panel(self, path: str, cfg: dict | None = None) -> None:
-        """Load the finished image into the preview and populate run details."""
-        # Image
-        try:
-            from PIL import Image
-            self._preview_pil_img = Image.open(path)
-            self._redraw_preview()
-        except Exception:
-            pass
+        """Load the finished output into the preview and populate run details."""
+        self._stop_video_playback()
+
+        if path and path.lower().endswith(".mp4"):
+            # Hide static image, show controls bar, load frames in background
+            self._preview_pil_img = None
+            self._preview_label.config(image="", text="Loading video …")
+            self._video_ctrl_bar.pack(fill="x", padx=4, pady=(0, 4))
+
+            def _load():
+                frames, fps = _load_video_frames(path)
+                self.root.after(0, self._start_video_playback, frames, fps)
+
+            threading.Thread(target=_load, daemon=True).start()
+        else:
+            # Static image — hide controls bar
+            self._video_ctrl_bar.pack_forget()
+            try:
+                from PIL import Image
+                self._preview_pil_img = Image.open(path)
+                self._redraw_preview()
+            except Exception:
+                pass
 
         # Details
         if cfg is None:
@@ -478,12 +637,20 @@ class BaseSamplerApp(ABC):
         w, h = cfg.get("width", 0), cfg.get("height", 0)
         self._detail_vars["res"].set(f"{w} × {h}" if w and h else "—")
 
-        self._detail_vars["steps"].set(str(cfg.get("steps", "—")))
-        self._detail_vars["cfg"].set(str(cfg.get("cfg_scale", "—")))
+        if "steps_high" in cfg:
+            sh = cfg.get("steps_high", 0)
+            sl = cfg.get("steps_low", 0)
+            steps_str = f"{sh}+{sl}" if sl else str(sh)
+        else:
+            steps_str = str(cfg.get("steps", "—"))
+        self._detail_vars["steps"].set(steps_str)
+        cfg_val = cfg.get("cfg_scale", "—")
+        cfg2    = cfg.get("cfg_scale_2")
+        self._detail_vars["cfg"].set(f"{cfg_val}/{cfg2}" if cfg2 is not None else str(cfg_val))
 
         sched = cfg.get("scheduler", "")
-        shift = cfg.get("sigma_shift", "")
-        if sched and shift != "":
+        shift = cfg.get("sigma_shift", None)
+        if sched and shift is not None:
             self._detail_vars["sampler"].set(f"{sched}  σ={shift}")
         else:
             self._detail_vars["sampler"].set(sched or "—")
@@ -504,10 +671,109 @@ class BaseSamplerApp(ABC):
     def _set_model_status(self, text: str, warn: bool = False) -> None:
         self._stop_blink()
         self._model_status_var.set(text)
+        self._append_log(f"[model] {text}")
         if warn:
             self._start_blink()
         else:
             self._model_status_label.config(foreground="gray")
+
+    # ==================================================================
+    # Session log
+    # ==================================================================
+
+    def _append_log(self, msg: str) -> None:
+        if not msg:
+            return
+        ts   = time.strftime("%H:%M:%S")
+        line = f"{ts}  {msg}"
+        self._log_lines.append(line)
+        if self._log_text is not None:
+            try:
+                self._log_text.configure(state="normal")
+                self._log_text.insert("end", line + "\n")
+                self._log_text.configure(state="disabled")
+                self._log_text.see("end")
+            except tk.TclError:
+                pass  # window was destroyed between check and write
+
+    def _open_log_window(self) -> None:
+        if self._log_win is not None:
+            try:
+                self._log_win.lift()
+                self._log_win.focus_force()
+                return
+            except tk.TclError:
+                pass  # window was destroyed; recreate below
+
+        win = tk.Toplevel(self.root)
+        win.title("Session Log")
+        win.geometry("900x380")
+        win.configure(background="#1e1e1e")
+
+        btn_row = tk.Frame(win, background="#1e1e1e")
+        btn_row.pack(fill="x", padx=4, pady=4)
+
+        def _clear_log():
+            self._log_lines.clear()
+            if self._log_text is not None:
+                self._log_text.configure(state="normal")
+                self._log_text.delete("1.0", "end")
+                self._log_text.configure(state="disabled")
+
+        def _copy_log():
+            win.clipboard_clear()
+            win.clipboard_append("\n".join(self._log_lines))
+
+        def _dump_dynamo():
+            try:
+                import torch._dynamo.utils as _du
+                counters = dict(_du.counters)
+                self._append_log("── dynamo counters ──────────────────")
+                if counters:
+                    for k, v in sorted(counters.items()):
+                        if isinstance(v, dict):
+                            for k2, v2 in sorted(v.items()):
+                                self._append_log(f"[dynamo] {k}/{k2}: {v2}")
+                        else:
+                            self._append_log(f"[dynamo] {k}: {v}")
+                else:
+                    self._append_log("[dynamo] no counters (no compiled graphs yet?)")
+            except Exception as exc:
+                self._append_log(f"[dynamo] error reading counters: {exc}")
+            try:
+                import torch._dynamo.utils as _du
+                self._append_log(f"[dynamo] compile_id={getattr(_du, 'compile_id', 'n/a')}")
+            except Exception:
+                pass
+            self._append_log("─────────────────────────────────────")
+
+        ttk.Button(btn_row, text="Clear",        command=_clear_log).pack(side="left", padx=2)
+        ttk.Button(btn_row, text="Copy All",     command=_copy_log).pack(side="left", padx=2)
+        ttk.Button(btn_row, text="Dynamo Stats", command=_dump_dynamo).pack(side="left", padx=2)
+
+        txt = ScrolledText(
+            win, state="disabled", wrap="word",
+            background="#1e1e1e", foreground="#cccccc",
+            font=("Consolas", 9), insertbackground="#cccccc",
+            relief="flat", borderwidth=0,
+        )
+        txt.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+
+        txt.configure(state="normal")
+        for line in self._log_lines:
+            txt.insert("end", line + "\n")
+        txt.configure(state="disabled")
+        txt.see("end")
+
+        self._log_win  = win
+        self._log_text = txt
+
+        def _on_close():
+            self._log_win  = None
+            self._log_text = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
 
     def _start_blink(self):
         self._stop_blink()
@@ -526,26 +792,6 @@ class BaseSamplerApp(ABC):
         )
         self._blink_id = self.root.after(500, self._do_blink)
 
-    def _on_model_setting_changed(self, *_):
-        if self.backend.model is not None:
-            self._set_model_status("⚠ Settings changed — reload required", warn=True)
-
-    def _set_busy(self, busy: bool) -> None:
-        self._busy = busy
-        self._add_queue_btn.config(state="disabled" if busy else "normal")
-        if not busy:
-            # Model may just have finished loading — kick off pending jobs if any
-            self._auto_start_queue()
-
-    def _run_in_thread(self, fn) -> None:
-        self._set_busy(True)
-        def _work():
-            try:
-                fn()
-            finally:
-                self.root.after(0, self._set_busy, False)
-        threading.Thread(target=_work, daemon=True).start()
-
     # ==================================================================
     # Shared LoRA panel logic
     # ==================================================================
@@ -563,19 +809,8 @@ class BaseSamplerApp(ABC):
         self._on_lora_frame_configure()
         self._save_cfg()
 
-    def _apply_loras(self) -> None:
-        if self._busy or self._queue_running:
-            return
-        loras = self._get_lora_list()
-        self._run_in_thread(
-            lambda: self.backend.apply_loras(
-                loras,
-                on_status=lambda s: self.root.after(0, self._lora_status_var.set, s),
-            )
-        )
-
     def _clear_loras(self) -> None:
-        if self._busy or self._queue_running:
+        if self._queue_running:
             return
         self.backend.remove_loras()
         self._lora_status_var.set("LoRAs cleared")
@@ -655,17 +890,10 @@ class BaseSamplerApp(ABC):
             self._update_right_panel(job["output_path"], job.get("cfg"))
 
     def _auto_start_queue(self) -> None:
-        """Start the queue loop if idle and a pending job exists.
-
-        Called automatically after every Add-to-Queue and after every
-        _set_busy(False) (e.g. model just finished loading).
-        """
-        if self._queue_running or self._busy:
+        """Start the queue loop if idle and a pending job exists."""
+        if self._queue_running:
             return
         if not any(j["status"] == "Pending" for j in self._queue):
-            return
-        if self.backend.model is None:
-            self._queue_status_var.set("Load model to run")
             return
         self._queue_running        = True
         self._queue_stop_requested = False
@@ -684,8 +912,29 @@ class BaseSamplerApp(ABC):
                     break
 
                 job["status"] = "Running"
-                self.root.after(0, self._queue_update_job, job)
                 cfg = job["cfg"]
+                self.root.after(0, self._queue_update_job, job)
+
+                self.backend._cancel_event.clear()
+
+                # ── lazy model load ───────────────────────────────────────────
+                if self.backend.model_needs_reload(cfg):
+                    self.root.after(0, self._queue_status_var.set, "Loading model …")
+                    try:
+                        self.backend.load_model(
+                            cfg,
+                            on_status=lambda s: self.root.after(
+                                0, self._set_model_status, s),
+                        )
+                    except Exception as exc:
+                        job["status"] = "Error"
+                        self.root.after(0, self._queue_update_job, job)
+                        self.root.after(0, self._queue_status_var.set,
+                                        f"Load error: {str(exc)[:80]}")
+                        self.root.after(0, self._set_model_status,
+                                        f"Error: {exc}")
+                        continue
+
                 remaining = sum(1 for j in self._queue if j["status"] == "Pending")
                 prompt_short = cfg.get("prompt", "")[:28].replace("\n", " ")
                 status_str = f"{prompt_short}…" + (f"  ({remaining} more)" if remaining else "")
@@ -716,14 +965,21 @@ class BaseSamplerApp(ABC):
 
                 _t0      = [None]   # time of first callback
                 _s0      = [None]   # step value of first callback
+                _tlast   = [None]   # time of previous callback (per-step timing)
+                _baseline = [None]  # median step time after warmup, for recompile detection
 
                 def _prog(step, t):
                     now = time.monotonic()
                     if _t0[0] is None:
-                        _t0[0] = now
-                        _s0[0] = step
+                        _t0[0]    = now
+                        _s0[0]    = step
+                        _tlast[0] = now
                         label = f"{step}/{t}"
+                        self.root.after(0, self._append_log,
+                                        f"[step]  {step}/{t}  — first step (compile warmup)")
                     else:
+                        step_dt = now - _tlast[0]
+                        _tlast[0] = now
                         steps_done = step - _s0[0]
                         if steps_done > 0:
                             spi = (now - _t0[0]) / steps_done
@@ -732,6 +988,18 @@ class BaseSamplerApp(ABC):
                             label = f"{step}/{t}  {spi:.1f}s/it  ETA {m}:{s_rem:02d}"
                         else:
                             label = f"{step}/{t}"
+                        # Establish baseline from first post-warmup step (step 2+).
+                        # Flag only when the current step is >2× the baseline —
+                        # this detects genuine recompile events without triggering
+                        # on normal GGUF / quantised-model operation speed.
+                        if steps_done == 1:
+                            _baseline[0] = step_dt   # first steady-state sample
+                        flag = ""
+                        if (_baseline[0] is not None and steps_done > 1
+                                and step_dt > _baseline[0] * 2.0):
+                            flag = "  *** SLOW — possible recompile"
+                        self.root.after(0, self._append_log,
+                                        f"[step]  {step}/{t}  {step_dt:.2f}s{flag}")
                     self.root.after(0, lambda s=step, tt=t, lbl=label: (
                         self._progress.configure(value=s),
                         self._step_label_var.set(lbl),
@@ -741,6 +1009,7 @@ class BaseSamplerApp(ABC):
                     done_seed[0] = actual_seed
                 def _error(msg):
                     error_msg[0] = msg
+                    self.root.after(0, self._append_log, f"[error] {msg}")
 
                 _sample_t0 = time.monotonic()
                 self.backend.sample(cfg, _prog, _done, _error)
@@ -834,7 +1103,7 @@ class BaseSamplerApp(ABC):
         self._attn_avail_var.set("  ".join(parts))
 
     def _on_dtype_changed(self, *_) -> None:
-        is_gguf = (self._dtype_var.get() == "GGUF")
+        is_gguf = self._dtype_var.get() in {"GGUF", "GGUF_A8I", "GGUF_A8F"}
         if is_gguf:
             self._gguf_frame.grid()
             self._svd_var.set(False)
@@ -922,6 +1191,7 @@ class BaseSamplerApp(ABC):
         self._queue_stop_requested = True
         self.backend.cancel()
         self._stop_blink()
+        self._stop_video_playback()
         self._save_cfg()
 
     def _on_close(self) -> None:

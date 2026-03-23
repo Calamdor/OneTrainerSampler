@@ -55,6 +55,21 @@ def apply_dark_theme(root: tk.Tk) -> None:
         bordercolor=[("active", BLUE_DARK)],
     )
 
+    # ── Accent button ("＋ Add to Queue") ──────────────────────────────────
+    GREEN       = "#1a6b3c"
+    GREEN_HOVER = "#22914f"
+    s.configure("Accent.TButton",
+        background=GREEN, foreground="#ffffff",
+        bordercolor=GREEN_HOVER,
+        lightcolor=GREEN, darkcolor=GREEN,
+        padding=(8, 3),
+    )
+    s.map("Accent.TButton",
+        background=[("pressed", "#0e4a28"), ("active", GREEN_HOVER)],
+        foreground=[("pressed", "#ffffff"), ("active", "#ffffff")],
+        bordercolor=[("active", GREEN_HOVER)],
+    )
+
     # ── Entry ─────────────────────────────────────────────────────────────────
     s.configure("TEntry",
         fieldbackground=BG_INPUT, foreground=FG,

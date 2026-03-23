@@ -19,7 +19,8 @@ ASPECT_RATIOS = [
 
 ASPECT_RATIO_LABELS = [r[0] for r in ASPECT_RATIOS]
 ASPECT_RATIO_MAP    = {r[0]: (r[1], r[2]) for r in ASPECT_RATIOS}
-PIXEL_TARGET_OPTIONS = ["512", "768", "896", "1024", "1152", "1280", "1536", "2048"]
+PIXEL_TARGET_OPTIONS     = ["512", "768", "896", "1024", "1152", "1280", "1536", "2048"]
+WAN_PIXEL_TARGET_OPTIONS = ["320", "480", "640", "720", "960"]
 
 ATTN_BACKEND_OPTIONS   = ["Auto", "Flash", "SageAttn"]
 ATTN_BACKEND_ENUM_NAME = {"Flash": "FLASH", "SageAttn": "SAGE"}

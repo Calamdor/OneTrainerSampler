@@ -1,4 +1,4 @@
-"""ChromaSamplerApp — Chroma-specific sampler GUI.
+"""WanSamplerApp — Wan2.2 T2V-A14B sampler GUI.
 
 Implements the abstract interface of BaseSamplerApp.  All shared logic
 (queue, lora panel, output panel, generate/abort, blink, token counter)
@@ -19,55 +19,52 @@ from sampler_core.util.dtype_maps import (
     COMPUTE_DTYPE_OPTIONS, SVD_DTYPE_OPTIONS,
 )
 from sampler_core.util.resolution import (
-    ATTN_BACKEND_OPTIONS, ASPECT_RATIO_LABELS, PIXEL_TARGET_OPTIONS,
-    compute_dims,
+    ATTN_BACKEND_OPTIONS, ASPECT_RATIO_LABELS,
+    compute_dims, WAN_PIXEL_TARGET_OPTIONS,
 )
-from chroma.backend import ChromaBackend
+from wan.backend import WanBackend
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-_DEFAULT_NEGATIVE = (
-    "This low-quality, greyscale, unfinished sketch is inaccurate and flawed. "
-    "The image is very blurred and lacks detail, with excessive chromatic "
-    "aberrations and artifacts. The image is overly saturated with excessive bloom."
-)
-
 DEFAULTS = {
-    "base_model":       "lodestones/Chroma1-HD",
-    "transformer_gguf": "",
-    "weight_dtype":     "NF4",
-    "text_enc_dtype":   "BF16",
-    "svd_enabled":      False,
-    "svd_rank":         16,
-    "svd_dtype":        "BF16",
-    "quant_cache_dir":  "",
+    "base_model_path":    "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    "transformer_1_gguf": "",
+    "transformer_2_gguf": "",
+    "weight_dtype":       "NF4",
+    "text_enc_dtype":     "BF16",
+    "svd_enabled":        False,
+    "svd_rank":           16,
+    "svd_dtype":          "BF16",
+    "quant_cache_dir":    "",
+    "use_compile":        False,
+    "compute_dtype":      "Auto",
+    "fast_fp16_accum":    False,
+    "offload_enabled":    False,
+    "offload_fraction":   50,
+    "attn_backend":       "Auto",
+    "scheduler":          "Euler",
     "text_cache_enabled": False,
-    "use_compile":      False,
-    "compute_dtype":    "Auto",
-    "fast_fp16_accum":  False,
-    "offload_enabled":  False,
-    "offload_fraction": 50,
-    "attn_backend":     "Auto",
-    "loras":            [],
-    "prompt":           "",
-    "negative_prompt":  _DEFAULT_NEGATIVE,
-    "pixel_target":     1024,
-    "aspect_ratio":     "1:1",
-    "scheduler":        "Euler",
-    "sigma_shift":      3.0,
-    "steps":            30,
-    "cfg_scale":        3.5,
-    "seed":             42,
-    "random_seed":      False,
-    "output_dir":       os.path.join(os.path.dirname(_SCRIPT_DIR), "output"),
+    "loras":              [],
+    "prompt":             "",
+    "negative_prompt":    "",
+    "pixel_target":       640,
+    "aspect_ratio":       "16:9",
+    "frames":             81,
+    "cfg_scale":          5.0,
+    "cfg_scale_2":        5.0,
+    "steps_high":         20,
+    "steps_low":          0,
+    "seed":               42,
+    "random_seed":        False,
+    "output_dir":         os.path.join(os.path.dirname(_SCRIPT_DIR), "output"),
 }
 
-CONFIG_PATH = os.path.join(os.path.dirname(_SCRIPT_DIR), "config", "chroma_sampler_config.json")
+CONFIG_PATH = os.path.join(os.path.dirname(_SCRIPT_DIR), "config", "wan_sampler_config.json")
 
 
-class ChromaSamplerApp(BaseSamplerApp):
+class WanSamplerApp(BaseSamplerApp):
     def __init__(self, root: tk.Tk, container: tk.Frame | None = None):
-        super().__init__(root, ChromaBackend(), DEFAULTS, CONFIG_PATH, "Chroma Sampler",
+        super().__init__(root, WanBackend(), DEFAULTS, CONFIG_PATH, "Wan2.2 Sampler",
                          container=container)
 
     # ==================================================================
@@ -80,14 +77,14 @@ class ChromaSamplerApp(BaseSamplerApp):
 
         r = 0
         ttk.Label(model_frame, text="Base model:").grid(row=r, column=0, sticky="w", **pad)
-        self._base_model_var = tk.StringVar(value=self.cfg.get("base_model", ""))
+        self._base_model_var = tk.StringVar(value=self.cfg.get("base_model_path", ""))
         _base_entry = ttk.Entry(model_frame, textvariable=self._base_model_var, width=55)
         _base_entry.grid(row=r, column=1, sticky="ew", **pad)
         Tooltip(_base_entry,
-                "Path to the Chroma base model directory (HuggingFace diffusers format).\n\n"
-                "Expected contents: transformer/, text_encoder/, tokenizer/,\n"
-                "scheduler/scheduler_config.json, model_index.json.\n\n"
-                "Example: lodestones/Chroma1-HD  or  D:/models/Chroma1-HD")
+                "Path to the Wan2.2 base model directory (HuggingFace diffusers format).\n\n"
+                "Expected contents: transformer/, transformer_2/, text_encoder/,\n"
+                "tokenizer/, scheduler/, model_index.json.\n\n"
+                "Example: Wan-AI/Wan2.2-T2V-A14B-Diffusers  or  D:/models/Wan2.2-A14B")
         ttk.Button(model_frame, text="Browse…", command=self._browse_model).grid(
             row=r, column=2, **pad)
 
@@ -102,11 +99,10 @@ class ChromaSamplerApp(BaseSamplerApp):
         )
         _dtype_cb.pack(side="left", padx=(4, 16))
         Tooltip(_dtype_cb,
-                "Weight dtype for the transformer (DiT).\n\n"
+                "Weight dtype for both transformer experts (HIGH and LOW).\n\n"
                 "BF16 / FP16  — full precision; best quality, highest VRAM.\n"
                 "NF4          — 4-bit NormalFloat; good quality, ~4× less VRAM.\n"
-                "W8A8         — 8-bit weight + 8-bit activation (SVDQuant).\n"
-                "GGUF         — loads a .gguf file; dequantizes to BF16 at runtime.\n"
+                "GGUF         — loads .gguf files for T1 and T2; dequantizes to BF16 at runtime.\n"
                 "GGUF_A8I     — GGUF + int8 activation requant; torch.compile-friendly. Requires RTX 3000+ (sm80+).\n"
                 "GGUF_A8F     — GGUF + fp8 activation requant; torch.compile-friendly. Requires RTX 4000+ (sm89+).\n\n"
                 "torch.compile benefits BF16/FP16 and all GGUF variants.\n"
@@ -121,20 +117,17 @@ class ChromaSamplerApp(BaseSamplerApp):
         Tooltip(_te_dtype_cb,
                 "Weight dtype for the T5-XXL text encoder.\n\n"
                 "BF16 — recommended; good quality, moderate VRAM.\n"
-                "NF4  — 4-bit quantization; less VRAM at slight quality cost.\n"
-                "FP32 — highest precision; rarely needed.\n\n"
-                "The text encoder is always offloaded to CPU after encoding\n"
-                "to free VRAM for the transformer.")
+                "NF4  — 4-bit quantization; less VRAM at slight quality cost.\n\n"
+                "The text encoder is always offloaded to CPU after encoding.")
         self._offload_enabled_var = tk.BooleanVar(value=self.cfg.get("offload_enabled", False))
         _offload_chk = ttk.Checkbutton(dtype_row, text="Layer offload",
                                        variable=self._offload_enabled_var)
         _offload_chk.pack(side="left")
         Tooltip(_offload_chk,
                 "Layer offload: streams transformer blocks CPU↔GPU during inference.\n\n"
-                "Allows running models that don't fit in VRAM at the cost of speed.\n"
+                "Allows running the 14B dual-expert model with limited VRAM.\n"
                 "The fraction below controls what percentage of blocks stay on GPU;\n"
-                "lower = less VRAM used, more CPU↔GPU transfers, slower inference.\n\n"
-                "Not compatible with torch.compile (compile is disabled automatically).")
+                "lower = less VRAM used, more CPU↔GPU transfers, slower inference.")
         self._offload_fraction_var = tk.IntVar(value=self.cfg.get("offload_fraction", 50))
         _offload_spin = ttk.Spinbox(
             dtype_row, textvariable=self._offload_fraction_var,
@@ -142,10 +135,10 @@ class ChromaSamplerApp(BaseSamplerApp):
         )
         _offload_spin.pack(side="left", padx=(2, 1))
         Tooltip(_offload_spin,
-                "Percentage of transformer blocks to keep on GPU during inference.\n\n"
-                "100% = all blocks on GPU (no offloading, maximum speed).\n"
-                "50%  = half on GPU (moderate VRAM saving).\n"
-                "1%   = nearly all on CPU (minimum VRAM, very slow).")
+                "Percentage of transformer blocks to keep on GPU per expert.\n\n"
+                "99% = almost all blocks on GPU (minimal offloading).\n"
+                "50% = half on GPU (moderate VRAM saving).\n"
+                "1%  = nearly all on CPU (minimum VRAM, very slow).")
         ttk.Label(dtype_row, text="%", foreground="gray").pack(side="left", padx=(0, 12))
         ttk.Label(dtype_row, text="Attn:").pack(side="left", padx=(4, 2))
         self._attn_var = tk.StringVar(value=self.cfg.get("attn_backend", "Auto"))
@@ -156,11 +149,10 @@ class ChromaSamplerApp(BaseSamplerApp):
         _attn_cb.pack(side="left", padx=(0, 4))
         Tooltip(_attn_cb,
                 "Attention kernel backend.\n\n"
-                "Auto      — uses Flash Attention if available, else PyTorch SDPA.\n"
-                "Flash     — xformers / flash_attn; fast, low memory (requires install).\n"
-                "SageAttn  — SageAttention; fastest on supported GPUs (requires install).\n"
-                "PyTorch   — built-in SDPA; always available, slightly slower.\n\n"
-                "Availability is shown in the ✓/✗ indicators to the right.")
+                "Auto     — uses Flash Attention if available, else PyTorch SDPA.\n"
+                "Flash    — flash_attn; fast, low memory (requires install).\n"
+                "SageAttn — SageAttention; fastest on supported GPUs (requires install).\n"
+                "           Note: may produce Q/K int8 overflow artifacts on Wan2.2.")
         self._attn_avail_var = tk.StringVar()
         ttk.Label(dtype_row, textvariable=self._attn_avail_var,
                   font=("TkDefaultFont", 8), foreground="gray").pack(side="left")
@@ -178,39 +170,38 @@ class ChromaSamplerApp(BaseSamplerApp):
         Tooltip(_compute_cb,
                 "Autocast dtype for compute (matmuls, attention).\n\n"
                 "Auto  — matches the transformer weight dtype (recommended).\n"
-                "BF16  — brain-float16; wider dynamic range, no INF/NaN overflow.\n"
+                "BF16  — brain-float16; wider dynamic range.\n"
                 "FP16  — float16; slightly faster on some hardware.\n\n"
-                "WARNING: FP16 compute with BF16 weights can produce NaN outputs\n"
-                "because BF16 exponent range exceeds FP16 max. Use BF16 or Auto.")
+                "WARNING: FP16 compute with BF16 weights can produce NaN outputs.")
         self._fast_fp16_var = tk.BooleanVar(value=self.cfg.get("fast_fp16_accum", False))
         _fast_fp16_chk = ttk.Checkbutton(compute_row, text="Fast FP16 accum",
                                          variable=self._fast_fp16_var)
         _fast_fp16_chk.pack(side="left")
         Tooltip(_fast_fp16_chk,
                 "Enable reduced-precision FP16 accumulation in CUDA matmuls.\n\n"
-                "Sets torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction.\n"
-                "Faster matrix multiplications on Ampere+ GPUs (RTX 3000+).\n\n"
-                "May reduce numerical precision in edge cases. Generally safe for\n"
-                "inference. No effect if compute dtype is BF16 or FP32.")
+                "Faster on Ampere+ GPUs (RTX 3000+). Generally safe for inference.")
         ttk.Label(compute_row,
                   text="(Auto = tied to weight dtype;  FP16 accum = faster matmuls, Ampere+)",
                   foreground="gray", font=("TkDefaultFont", 8)).pack(side="left", padx=8)
 
         r += 1
-        # GGUF row — shown only when dtype == "GGUF"
+        # GGUF row — shown only when dtype == "GGUF"; contains two file paths (T1 and T2)
         self._gguf_frame = ttk.Frame(model_frame)
         self._gguf_frame.grid(row=r, column=0, columnspan=3, sticky="ew", **pad)
-        ttk.Label(self._gguf_frame, text="Transformer GGUF:").pack(side="left")
-        self._gguf_var = tk.StringVar(value=self.cfg.get("transformer_gguf", ""))
-        _gguf_entry = ttk.Entry(self._gguf_frame, textvariable=self._gguf_var, width=52)
-        _gguf_entry.pack(side="left", padx=4)
-        Tooltip(_gguf_entry,
-                "Path to a GGUF-quantized transformer file.\n\n"
-                "Required for GGUF, GGUF_A8I, and GGUF_A8F dtypes.\n"
-                "The base model path is still required for the text encoder,\n"
-                "tokenizer, and scheduler config.")
+        ttk.Label(self._gguf_frame, text="T1 GGUF:").pack(side="left")
+        self._t1_gguf_var = tk.StringVar(value=self.cfg.get("transformer_1_gguf", ""))
+        _t1_entry = ttk.Entry(self._gguf_frame, textvariable=self._t1_gguf_var, width=38)
+        _t1_entry.pack(side="left", padx=(3, 2))
+        Tooltip(_t1_entry, "Path to GGUF file for the HIGH-noise expert (transformer 1).")
         ttk.Button(self._gguf_frame, text="Browse…",
-                   command=lambda: self._browse_gguf(self._gguf_var)).pack(side="left", padx=2)
+                   command=lambda: self._browse_gguf(self._t1_gguf_var)).pack(side="left", padx=(0, 10))
+        ttk.Label(self._gguf_frame, text="T2 GGUF:").pack(side="left")
+        self._t2_gguf_var = tk.StringVar(value=self.cfg.get("transformer_2_gguf", ""))
+        _t2_entry = ttk.Entry(self._gguf_frame, textvariable=self._t2_gguf_var, width=38)
+        _t2_entry.pack(side="left", padx=(3, 2))
+        Tooltip(_t2_entry, "Path to GGUF file for the LOW-noise expert (transformer 2).")
+        ttk.Button(self._gguf_frame, text="Browse…",
+                   command=lambda: self._browse_gguf(self._t2_gguf_var)).pack(side="left", padx=2)
         self._gguf_frame.grid_remove()
 
         r += 1
@@ -218,35 +209,31 @@ class ChromaSamplerApp(BaseSamplerApp):
         cache_row.grid(row=r, column=0, columnspan=3, sticky="ew", **pad)
         ttk.Label(cache_row, text="Quant cache:").pack(side="left")
         self._cache_var = tk.StringVar(value=self.cfg.get("quant_cache_dir", ""))
-        _cache_entry = ttk.Entry(cache_row, textvariable=self._cache_var, width=48)
+        _cache_entry = ttk.Entry(cache_row, textvariable=self._cache_var, width=50)
         _cache_entry.pack(side="left", padx=4)
         Tooltip(_cache_entry,
                 "Directory for quantization cache files (NF4, SVDQuant, etc.).\n\n"
-                "First load computes quantization and saves to this directory.\n"
-                "Subsequent loads read from cache — dramatically faster startup.\n\n"
-                "Leave empty to auto-detect from OneTrainer's active config.\n"
-                "Text encoder embeddings (if cached) are stored in a te_cache/\n"
-                "subdirectory inside this directory.")
+                "First load computes quantization and saves here; subsequent loads\n"
+                "read from cache — much faster startup.\n\n"
+                "Leave empty to auto-detect from OneTrainer's active config.")
         ttk.Button(cache_row, text="Browse…", command=self._browse_cache_dir).pack(side="left", padx=2)
-        _from_ot_btn = ttk.Button(cache_row, text="From OT",  command=self._use_ot_cache_dir)
+        _from_ot_btn = ttk.Button(cache_row, text="From OT", command=self._use_ot_cache_dir)
         _from_ot_btn.pack(side="left", padx=2)
         Tooltip(_from_ot_btn,
-                "Read cache_dir from OneTrainer's active training config\n"
-                "(OneTrainer/config.json) and set it as the quant cache directory.\n\n"
-                "Open a training config in OT first, then click this to sync.")
+                "Read cache_dir from OneTrainer's active training config and set it\n"
+                "as the quant cache directory.  Open a config in OT first.")
         ttk.Label(cache_row, text="(empty = auto from OT config)",
                   foreground="gray", font=("TkDefaultFont", 8)).pack(side="left", padx=4)
         self._text_cache_var = tk.BooleanVar(value=self.cfg.get("text_cache_enabled", False))
-        _tc_chk = ttk.Checkbutton(cache_row, text="Text embed cache",
+        _tc_chk = ttk.Checkbutton(cache_row, text="Cache T5 embeddings",
                                   variable=self._text_cache_var)
-        _tc_chk.pack(side="left", padx=(16, 2))
+        _tc_chk.pack(side="left", padx=(12, 0))
         Tooltip(_tc_chk,
-            "Cache T5 text encoder embeddings to disk.\n\n"
-            "On first use: runs T5 and saves the result under Cache dir/te_cache/.\n"
-            "On subsequent uses with the same prompt + precision: skips T5 entirely.\n\n"
-            "Cache key includes: positive prompt, negative prompt, text enc dtype.\n"
-            "Useful when iterating on steps/cfg/seed while keeping the same prompt."
-        )
+                "Cache UMT5 text encoder embeddings to disk.\n\n"
+                "First generation encodes and saves both positive and negative\n"
+                "embeddings; subsequent generations with the same prompts load\n"
+                "from cache — T5 never moves to GPU VRAM on a cache hit.\n\n"
+                "Cache is stored in quant_cache_dir/te_cache/  (or output/ if unset).")
 
         r += 1
         svd_row = ttk.Frame(model_frame)
@@ -255,15 +242,9 @@ class ChromaSamplerApp(BaseSamplerApp):
         _svd_chk = ttk.Checkbutton(svd_row, text="SVDQuant", variable=self._svd_var)
         _svd_chk.pack(side="left")
         Tooltip(_svd_chk,
-            "SVDQuant: improves quality at a given bit-width by extracting a low-rank\n"
-            "correction from the weight matrix before quantization.\n\n"
-            "Uses: transformer weights (set by Weight dtype above).\n"
-            "rank — number of singular vectors kept in full precision.\n"
-            "residual dtype — precision of the SVD correction factors (U·S and Vᵀ);\n"
-            "  the remaining residual is stored in the Weight dtype (NF4 / INT8 etc.).\n\n"
-            "First load computes full SVD (slow); set Quant cache dir to save results\n"
-            "so subsequent loads are instant."
-        )
+                "SVDQuant: extracts a low-rank correction from weights before quantization\n"
+                "to improve quality at a given bit-width.\n\n"
+                "First load computes full SVD (slow); set Quant cache to save results.")
         _lbl_rank = ttk.Label(svd_row, text="rank:")
         _lbl_rank.pack(side="left", padx=(8, 2))
         self._svd_rank_var = tk.IntVar(value=self.cfg.get("svd_rank", 16))
@@ -283,10 +264,8 @@ class ChromaSamplerApp(BaseSamplerApp):
         Tooltip(_compile_chk,
                 "torch.compile — fuses operations for faster inference.\n\n"
                 "Only beneficial for float weight dtypes (BF16, FP16).\n"
-                "Has NO effect on quantized weights (NF4, W8A8, GGUF, etc.) —\n"
-                "those use custom CUDA kernels that compile cannot optimize.\n\n"
-                "First sample after loading will be slow (compile warmup).\n"
-                "Subsequent samples reuse the cached compiled graph.")
+                "First sample after loading will be slow (compile warmup).")
+        # Required by _on_dtype_changed in base class
         self._svd_row_widgets = [_svd_chk, _lbl_rank, _svd_spin, _lbl_res, _svd_combo]
 
         r += 1
@@ -309,109 +288,135 @@ class ChromaSamplerApp(BaseSamplerApp):
     def _build_gen_params(self, gen_frame: ttk.LabelFrame, r: int) -> int:
         pad = {"padx": 6, "pady": 3}
 
+        # Resolution row: pixel target + aspect ratio + dims label + frames
         res_row = ttk.Frame(gen_frame)
         res_row.grid(row=r, column=0, columnspan=7, sticky="w", **pad)
+
         ttk.Label(res_row, text="Pixels:").pack(side="left")
-        self._pixel_target_var = tk.StringVar(value=str(self.cfg.get("pixel_target", 1024)))
+        self._pixel_target_var = tk.StringVar(
+            value=str(self.cfg.get("pixel_target", 640)))
         _pixel_cb = ttk.Combobox(
             res_row, textvariable=self._pixel_target_var,
-            values=PIXEL_TARGET_OPTIONS, width=6,
+            values=WAN_PIXEL_TARGET_OPTIONS, width=5,
         )
         _pixel_cb.pack(side="left", padx=(3, 12))
         Tooltip(_pixel_cb,
-                "Target pixel count (width × height) for the generated image.\n\n"
+                "Target pixel size for the generated video frame.\n\n"
                 "The actual resolution is computed by scaling the chosen aspect ratio\n"
-                "to match this pixel budget, then rounding to the nearest 16px multiple.\n\n"
-                "Higher pixel counts need more VRAM and more steps for good detail.\n"
-                "Chroma was trained at 1 MP (1024² equivalent) — this is the sweet spot.")
+                "to this pixel budget (quantized to 16px), shown in blue to the right.\n\n"
+                "Typical 16:9 outputs at quantize=16:\n"
+                "  960 → 1280×720 (720p)\n"
+                "  720 → 960×544\n"
+                "  640 → 848×480\n"
+                "  480 → 640×368\n"
+                "  320 → 432×240")
+
         ttk.Label(res_row, text="Aspect:").pack(side="left")
-        self._aspect_var = tk.StringVar(value=self.cfg.get("aspect_ratio", "1:1"))
+        self._aspect_var = tk.StringVar(value=self.cfg.get("aspect_ratio", "16:9"))
         _aspect_cb = ttk.Combobox(
             res_row, textvariable=self._aspect_var,
             values=ASPECT_RATIO_LABELS, state="readonly", width=7,
         )
         _aspect_cb.pack(side="left", padx=(3, 10))
         Tooltip(_aspect_cb,
-                "Aspect ratio of the generated image.\n\n"
-                "Combined with the Pixels target to determine the exact resolution\n"
-                "(shown in blue to the right after selection).\n\n"
-                "1:1 = square.  16:9 = widescreen.  9:16 = portrait.")
+                "Aspect ratio of the generated video frame.\n\n"
+                "Combined with the Pixels target to determine exact resolution\n"
+                "(shown in blue). Wan2.2 was trained on 16:9 and 9:16 content.")
+
         self._dims_label_var = tk.StringVar(value="")
         ttk.Label(res_row, textvariable=self._dims_label_var,
-                  foreground=BLUE, font=("TkDefaultFont", 8)).pack(side="left")
+                  foreground=BLUE, font=("TkDefaultFont", 8)).pack(side="left", padx=(0, 16))
+
+        ttk.Label(res_row, text="Frames:").pack(side="left")
+        self._frames_var = tk.IntVar(value=self.cfg.get("frames", 81))
+        _frames_entry = ttk.Entry(res_row, textvariable=self._frames_var, width=5)
+        _frames_entry.pack(side="left", padx=(3, 12))
+        Tooltip(_frames_entry,
+                "Number of video frames to generate.\n\n"
+                "Wan2.2 was trained on 4×N+1 frame counts: 1, 5, 9, … 81.\n"
+                "81 frames at typical resolution produces ~3s video at ~24fps.\n"
+                "Set to 1 to generate a single image (PNG output, no sidecar).")
+
+        ttk.Label(res_row, text="Scheduler:").pack(side="left")
+        self._scheduler_var = tk.StringVar(value=self.cfg.get("scheduler", "Euler"))
+        _sched_cb = ttk.Combobox(
+            res_row, textvariable=self._scheduler_var,
+            values=["Euler", "Heun"], state="readonly", width=6,
+        )
+        _sched_cb.pack(side="left", padx=(3, 0))
+        Tooltip(_sched_cb,
+                "Diffusion scheduler.\n\n"
+                "Euler — standard first-order flow matching (default).\n"
+                "Heun  — second-order predictor-corrector; higher quality\n"
+                "        at the same step count, but 2× NFE per step.\n\n"
+                "Wan2.2 calculates sigma shift automatically — no manual\n"
+                "shift control is needed.")
 
         for _v in (self._pixel_target_var, self._aspect_var):
             _v.trace_add("write", lambda *_: self._update_dims_label())
         self._update_dims_label()
 
         r += 1
-        # Sampling params row — scheduler / shift / steps / cfg / seed / rnd all inline
-        self._steps_var       = tk.IntVar(value=self.cfg.get("steps", 30))
-        self._cfg_var         = tk.DoubleVar(value=self.cfg.get("cfg_scale", 3.5))
-        self._seed_var        = tk.IntVar(value=self.cfg.get("seed", 42))
-        self._rnd_var         = tk.BooleanVar(value=self.cfg.get("random_seed", False))
-        self._scheduler_var   = tk.StringVar(value=self.cfg.get("scheduler", "Euler"))
-        self._sigma_shift_var = tk.DoubleVar(value=self.cfg.get("sigma_shift", 3.0))
-
+        # Steps / CFG row
         params_row = ttk.Frame(gen_frame)
         params_row.grid(row=r, column=0, columnspan=7, sticky="w", **pad)
 
-        ttk.Label(params_row, text="Scheduler:").pack(side="left")
-        _sched_cb = ttk.Combobox(
-            params_row, textvariable=self._scheduler_var,
-            values=["Euler", "Heun"], state="readonly", width=6,
-        )
-        _sched_cb.pack(side="left", padx=(3, 0))
-        Tooltip(_sched_cb,
-                "Euler — 1st order, 1 model call per step (default).\n"
-                "Heun  — 2nd order predictor-corrector, 2 model calls per step.\n\n"
-                "Heun produces better quality per sigma interval at 2× the cost.\n"
-                "Typical use: Heun at half the step count of Euler.")
+        self._steps_high_var = tk.IntVar(value=self.cfg.get("steps_high", 20))
+        self._steps_low_var  = tk.IntVar(value=self.cfg.get("steps_low", 0))
+        self._cfg_var        = tk.DoubleVar(value=self.cfg.get("cfg_scale", 5.0))
+        self._cfg2_var       = tk.DoubleVar(value=self.cfg.get("cfg_scale_2", 5.0))
+        self._seed_var       = tk.IntVar(value=self.cfg.get("seed", 42))
+        self._rnd_var        = tk.BooleanVar(value=self.cfg.get("random_seed", False))
 
-        ttk.Label(params_row, text="Shift:").pack(side="left", padx=(10, 0))
-        _shift_sb = ttk.Spinbox(
-            params_row, textvariable=self._sigma_shift_var,
-            from_=0.5, to=10.0, increment=0.5, width=4, format="%.1f",
-        )
-        _shift_sb.pack(side="left", padx=(3, 0))
-        Tooltip(_shift_sb,
-                "Sigma shift — controls how timesteps are distributed.\n\n"
-                "Higher values concentrate steps toward high-noise timesteps\n"
-                "(generally better at high resolution).\n"
-                "Default: 3.0 (FLUX/Chroma standard). Range: 0.5 – 10.0.")
+        ttk.Label(params_row, text="Steps (HIGH):").pack(side="left")
+        _sh_entry = ttk.Entry(params_row, textvariable=self._steps_high_var, width=5)
+        _sh_entry.pack(side="left", padx=(3, 8))
+        Tooltip(_sh_entry,
+                "Diffusion steps for the HIGH-noise expert (first phase).\n\n"
+                "Controls how much the HIGH expert refines the initial latent.\n"
+                "Typical range: 10–25. Higher = better quality, slower generation.")
+
+        ttk.Label(params_row, text="Steps (LOW):").pack(side="left")
+        _sl_entry = ttk.Entry(params_row, textvariable=self._steps_low_var, width=5)
+        _sl_entry.pack(side="left", padx=(3, 8))
+        Tooltip(_sl_entry,
+                "Diffusion steps for the LOW-noise expert (second phase).\n\n"
+                "Controls how much the LOW expert refines the denoised latent.\n"
+                "Set to 0 to skip the LOW expert entirely.")
 
         ttk.Separator(params_row, orient="vertical").pack(
-            side="left", fill="y", padx=10, pady=2)
+            side="left", fill="y", padx=8, pady=2)
 
-        ttk.Label(params_row, text="Steps:").pack(side="left", padx=(0, 2))
-        _steps_entry = ttk.Entry(params_row, textvariable=self._steps_var, width=5)
-        _steps_entry.pack(side="left", padx=(0, 8))
-        Tooltip(_steps_entry,
-                "Number of diffusion steps.\n\n"
-                "More steps = better quality, slower generation.\n"
-                "Euler: 20–30 is a good range. Heun: 10–15 (2× NFE per step).\n"
-                "Diminishing returns beyond ~40 steps.")
-        ttk.Label(params_row, text="CFG:").pack(side="left", padx=(0, 2))
+        ttk.Label(params_row, text="CFG:").pack(side="left")
         _cfg_entry = ttk.Entry(params_row, textvariable=self._cfg_var, width=5)
-        _cfg_entry.pack(side="left", padx=(0, 8))
+        _cfg_entry.pack(side="left", padx=(3, 8))
         Tooltip(_cfg_entry,
-                "Classifier-Free Guidance scale.\n\n"
-                "Controls how strongly the image follows the prompt.\n"
-                "1.0 = unconditioned (negative prompt has no effect).\n"
-                "3.0–4.5 = typical range for Chroma.\n"
-                "Higher values sharpen prompt adherence but can over-saturate.")
-        ttk.Label(params_row, text="Seed:").pack(side="left", padx=(0, 2))
+                "Classifier-Free Guidance scale for the HIGH-noise expert.\n\n"
+                "Controls how strongly the output follows the prompt.\n"
+                "Typical range: 3.0–7.0.")
+
+        ttk.Label(params_row, text="CFG2:").pack(side="left")
+        _cfg2_entry = ttk.Entry(params_row, textvariable=self._cfg2_var, width=5)
+        _cfg2_entry.pack(side="left", padx=(3, 8))
+        Tooltip(_cfg2_entry,
+                "CFG scale for the LOW-noise expert.\n\n"
+                "Ignored when Steps (LOW) is 0.\n"
+                "Typical range: 3.0–7.0.")
+
+        ttk.Separator(params_row, orient="vertical").pack(
+            side="left", fill="y", padx=8, pady=2)
+
+        ttk.Label(params_row, text="Seed:").pack(side="left")
         _seed_entry = ttk.Entry(params_row, textvariable=self._seed_var, width=8)
-        _seed_entry.pack(side="left", padx=(0, 8))
+        _seed_entry.pack(side="left", padx=(3, 8))
         Tooltip(_seed_entry,
                 "Random seed for the initial noise tensor.\n\n"
-                "Same seed + same settings = same image (reproducible).\n"
+                "Same seed + same settings = same video (reproducible).\n"
                 "Ignored when Rnd is checked.")
         _rnd_chk = ttk.Checkbutton(params_row, text="Rnd", variable=self._rnd_var)
         _rnd_chk.pack(side="left")
         Tooltip(_rnd_chk,
-                "Random seed — generates a new random seed for each image.\n\n"
-                "When checked, the Seed field is ignored.\n"
+                "Random seed — generates a new random seed for each video.\n\n"
                 "The seed used is shown in the output filename.")
 
         return r + 1
@@ -422,8 +427,11 @@ class ChromaSamplerApp(BaseSamplerApp):
         except (ValueError, tk.TclError):
             self._dims_label_var.set("")
             return
-        w, h = compute_dims(target, self._aspect_var.get())
+        w, h = compute_dims(target, self._aspect_var.get(), quantize=16)
         self._dims_label_var.set(f"→  {w} × {h}")
+
+    def _get_total_steps(self, cfg: dict) -> int:
+        return cfg.get("steps_high", 20) + cfg.get("steps_low", 0)
 
     # ==================================================================
     # Abstract interface — collect / LoRA
@@ -433,46 +441,51 @@ class ChromaSamplerApp(BaseSamplerApp):
         try:
             pixel = int(self._pixel_target_var.get())
         except (ValueError, AttributeError):
-            pixel = 1024
+            pixel = 640
         try:
             aspect = self._aspect_var.get()
         except AttributeError:
-            aspect = "1:1"
-        w, h = compute_dims(pixel, aspect)
+            aspect = "16:9"
+        w, h = compute_dims(pixel, aspect, quantize=16)
         return {
-            "base_model":       self._base_model_var.get(),
-            "transformer_gguf": self._gguf_var.get(),
-            "weight_dtype":     self._dtype_var.get(),
-            "text_enc_dtype":   self._te_dtype_var.get(),
-            "svd_enabled":      self._svd_var.get(),
-            "svd_rank":         self._svd_rank_var.get(),
-            "svd_dtype":        self._svd_dtype_var.get(),
-            "quant_cache_dir":     self._cache_var.get(),
-            "text_cache_enabled":  self._text_cache_var.get(),
-            "use_compile":         self._compile_var.get(),
-            "compute_dtype":    self._compute_dtype_var.get(),
-            "fast_fp16_accum":  self._fast_fp16_var.get(),
-            "offload_enabled":  self._offload_enabled_var.get(),
-            "offload_fraction": self._offload_fraction_var.get(),
-            "attn_backend":     self._attn_var.get(),
-            "loras":            self._get_lora_list(),
-            "prompt":           self._prompt_text.get("1.0", "end-1c"),
-            "negative_prompt":  self._neg_text.get("1.0", "end-1c"),
-            "pixel_target":     pixel,
-            "aspect_ratio":     aspect,
-            "width":            w,
-            "height":           h,
-            "scheduler":        self._scheduler_var.get(),
-            "sigma_shift":      self._sigma_shift_var.get(),
-            "steps":            self._steps_var.get(),
-            "cfg_scale":        self._cfg_var.get(),
-            "seed":             self._seed_var.get(),
-            "random_seed":      self._rnd_var.get(),
-            "output_dir":       self._outdir_var.get(),
+            "base_model_path":    self._base_model_var.get(),
+            "transformer_1_gguf": self._t1_gguf_var.get(),
+            "transformer_2_gguf": self._t2_gguf_var.get(),
+            "weight_dtype":       self._dtype_var.get(),
+            "text_enc_dtype":     self._te_dtype_var.get(),
+            "svd_enabled":        self._svd_var.get(),
+            "svd_rank":           self._svd_rank_var.get(),
+            "svd_dtype":          self._svd_dtype_var.get(),
+            "quant_cache_dir":    self._cache_var.get(),
+            "use_compile":        self._compile_var.get(),
+            "compute_dtype":      self._compute_dtype_var.get(),
+            "fast_fp16_accum":    self._fast_fp16_var.get(),
+            "offload_enabled":    self._offload_enabled_var.get(),
+            "offload_fraction":   self._offload_fraction_var.get(),
+            "attn_backend":       self._attn_var.get(),
+            "scheduler":          self._scheduler_var.get(),
+            "text_cache_enabled": self._text_cache_var.get(),
+            "loras":              self._get_lora_list(),
+            "prompt":             self._prompt_text.get("1.0", "end-1c"),
+            "negative_prompt":    self._neg_text.get("1.0", "end-1c"),
+            "pixel_target":       pixel,
+            "aspect_ratio":       aspect,
+            "width":              w,
+            "height":             h,
+            "frames":             self._frames_var.get(),
+            "cfg_scale":          self._cfg_var.get(),
+            "cfg_scale_2":        self._cfg2_var.get(),
+            "steps_high":         self._steps_high_var.get(),
+            "steps_low":          self._steps_low_var.get(),
+            "seed":               self._seed_var.get(),
+            "random_seed":        self._rnd_var.get(),
+            "output_dir":         self._outdir_var.get(),
         }
 
     def _add_lora(self, path: str = "", weight: float = 1.0, **kwargs) -> None:
         enabled = kwargs.get("enabled", True)
+        expert  = kwargs.get("expert", "AUTO")
+
         if path == "":
             path = filedialog.askopenfilename(
                 title="Select LoRA",
@@ -483,17 +496,34 @@ class ChromaSamplerApp(BaseSamplerApp):
 
         row_frame   = ttk.Frame(self._lora_inner)
         weight_var  = tk.DoubleVar(value=weight)
+        expert_var  = tk.StringVar(value=expert)
         enabled_var = tk.BooleanVar(value=enabled)
 
-        row = {"path": path, "weight_var": weight_var,
-               "enabled_var": enabled_var, "frame": row_frame}
+        row = {
+            "path": path, "weight_var": weight_var,
+            "expert_var": expert_var, "enabled_var": enabled_var,
+            "frame": row_frame,
+        }
 
         short = os.path.basename(path)
-        lbl = ttk.Label(row_frame, text=short, width=46, anchor="w")
+        lbl = ttk.Label(row_frame, text=short, width=38, anchor="w")
         lbl.pack(side="left", padx=2)
         lbl.bind("<Double-Button-1>", lambda e, p=path: messagebox.showinfo("Full path", p))
 
-        ttk.Entry(row_frame, textvariable=weight_var, width=7).pack(side="left", padx=2)
+        _w_entry = ttk.Entry(row_frame, textvariable=weight_var, width=6)
+        _w_entry.pack(side="left", padx=2)
+        Tooltip(_w_entry, "LoRA weight multiplier (1.0 = full strength).")
+        _expert_cb = ttk.Combobox(
+            row_frame, textvariable=expert_var,
+            values=["AUTO", "HIGH", "LOW", "BOTH"], state="readonly", width=6,
+        )
+        _expert_cb.pack(side="left", padx=2)
+        Tooltip(_expert_cb,
+                "Which Wan2.2 expert to apply this LoRA to.\n\n"
+                "AUTO — infer from filename (high/low/highnoise/lownoise).\n"
+                "HIGH — apply to the HIGH-noise expert (transformer 1).\n"
+                "LOW  — apply to the LOW-noise expert (transformer 2).\n"
+                "BOTH — apply to both experts with the same weights.")
         ttk.Checkbutton(row_frame, variable=enabled_var).pack(side="left", padx=2)
         tk.Button(
             row_frame, text="✕", fg="white", bg="#cc3333",
@@ -512,6 +542,7 @@ class ChromaSamplerApp(BaseSamplerApp):
             {
                 "path":    row["path"],
                 "weight":  row["weight_var"].get(),
+                "expert":  row["expert_var"].get(),
                 "enabled": row["enabled_var"].get(),
             }
             for row in self._lora_rows
@@ -522,5 +553,6 @@ class ChromaSamplerApp(BaseSamplerApp):
             self._add_lora(
                 path=entry.get("path", ""),
                 weight=entry.get("weight", 1.0),
+                expert=entry.get("expert", "AUTO"),
                 enabled=entry.get("enabled", True),
             )
