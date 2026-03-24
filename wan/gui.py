@@ -5,6 +5,7 @@ Implements the abstract interface of BaseSamplerApp.  All shared logic
 lives in the base class.
 """
 import os
+import random
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -408,16 +409,29 @@ class WanSamplerApp(BaseSamplerApp):
 
         ttk.Label(params_row, text="Seed:").pack(side="left")
         _seed_entry = ttk.Entry(params_row, textvariable=self._seed_var, width=8)
-        _seed_entry.pack(side="left", padx=(3, 8))
+        _seed_entry.pack(side="left", padx=(3, 4))
         Tooltip(_seed_entry,
                 "Random seed for the initial noise tensor.\n\n"
                 "Same seed + same settings = same video (reproducible).\n"
                 "Ignored when Rnd is checked.")
         _rnd_chk = ttk.Checkbutton(params_row, text="Rnd", variable=self._rnd_var)
-        _rnd_chk.pack(side="left")
+        _rnd_chk.pack(side="left", padx=(0, 2))
         Tooltip(_rnd_chk,
                 "Random seed — generates a new random seed for each video.\n\n"
                 "The seed used is shown in the output filename.")
+        _gen_btn = ttk.Button(params_row, text="Gen", width=4,
+                              command=lambda: (self._seed_var.set(random.randint(0, 2**31 - 1)),
+                                              self._rnd_var.set(False)))
+        _gen_btn.pack(side="left", padx=(0, 2))
+        Tooltip(_gen_btn,
+                "Generate a one-time random seed.\n\n"
+                "Rolls a random number into the Seed field and clears Rnd.\n"
+                "The seed stays fixed until you change it or click Gen again.")
+        _reset_btn = ttk.Button(params_row, text="42", width=3,
+                                command=lambda: (self._seed_var.set(42),
+                                                self._rnd_var.set(False)))
+        _reset_btn.pack(side="left", padx=(0, 8))
+        Tooltip(_reset_btn, "Reset seed to 42 and clear Rnd.")
 
         return r + 1
 

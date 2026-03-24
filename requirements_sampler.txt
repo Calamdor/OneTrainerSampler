@@ -1,0 +1,12 @@
+# OneTrainer Sampler — optional extra dependencies
+#
+# These packages are NOT part of OneTrainer's requirements.txt.
+# They add optional functionality to the sampler UI.
+#
+# Install manually:
+#   pip install -r requirements_sampler.txt
+#
+# Or let the sampler's auto-installer handle it on first launch.
+
+# Enables drag-and-drop files onto the preview panel.
+tkinterdnd2>=0.3.0

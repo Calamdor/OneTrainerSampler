@@ -231,10 +231,24 @@ class BaseSamplerBackend(ABC):
         # first to restore the original forward chain.  _WeightMerge handles
         # are order-independent (delta subtraction commutes), so reversed() is
         # safe for both types.
+        had_hooks = bool(self.lora_hooks)
         for h in reversed(self.lora_hooks):
             h.remove()
         self.lora_hooks.clear()
         self._applied_lora_sig = None
+        # When LoRA forward patches are removed, dynamo's cached graphs hold
+        # stale guards on the old patched callables.  Reset clears all cached
+        # graphs so the next sample() triggers a clean retrace that captures
+        # the current (unpatched) forward methods.
+        # NOTE: use torch._dynamo directly — do NOT write `import torch._dynamo`
+        # here.  A bare import inside a conditional block makes Python treat
+        # `torch` as a local name for the whole function, causing UnboundLocalError
+        # on `torch.cuda.empty_cache()` when the branch is not taken.
+        if had_hooks:
+            try:
+                torch._dynamo.reset()
+            except Exception:
+                pass
         gc.collect()
         torch.cuda.empty_cache()
 

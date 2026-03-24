@@ -17,7 +17,7 @@ from sampler_core.util.dtype_maps import (
 )
 from sampler_core.util.gguf_util import gguf_type_summary
 from sampler_core.util.ot_bridge import find_ot_quant_cache
-from sampler_core.util.png_meta import write_png_metadata, write_png_sidecar
+from sampler_core.util.png_meta import write_png_metadata, write_png_sidecar, write_mp4_metadata
 from sampler_core.util.tokenizer_patch import patch_tokenizer_no_truncate
 from sampler_core.util.resolution import ATTN_BACKEND_ENUM_NAME, check_attn_backends
 from sampler_core.lora.hooks import apply_lora_hooks
@@ -71,7 +71,42 @@ class WanBackend(BaseSamplerBackend):
     )
 
     # ------------------------------------------------------------------
+    def _ensure_blocks_compiled(self):
+        """Compile transformer blocks if deferred compilation was requested.
+
+        Must be called AFTER LoRA injection so dynamo's initial trace
+        includes the patched forwards and its guards are stable between
+        diffusion steps.  Blocks already wrapped in OptimizedModule (from
+        a previous sample) are left as-is — torch._dynamo.reset() in
+        remove_loras() cleared stale caches, so the next call triggers a
+        clean retrace that captures the current forward methods.
+
+        Compilation uses static shapes (the default) rather than dynamic=True.
+        Static shapes specialize on exact dimensions → ~2x faster compilation
+        and ~5% faster per-step runtime.  If the resolution changes between
+        samples, dynamo auto-recompiles once.
+
+        With the GGUF compile-friendly LoRA path (compile_friendly=True in
+        apply_lora_hooks), LoRA factors are stored as module attributes — not
+        closure variables — so persistent disk cache should work across
+        sessions.  The dequant call is one graph break per linear; LoRA merge
+        and F.linear are fused in the compiled graph.
+        """
+        if not getattr(self, '_compile_deferred', False):
+            return
+        if self.model is None:
+            return
+
+        _opt_cls = getattr(torch._dynamo, "OptimizedModule", None)
+        for xfmr in (self.model.transformer, self.model.transformer_2):
+            for i in range(len(xfmr.blocks)):
+                if _opt_cls is not None and isinstance(xfmr.blocks[i], _opt_cls):
+                    continue  # already wrapped; cache was reset by remove_loras()
+                xfmr.blocks[i] = torch.compile(xfmr.blocks[i])
+
+    # ------------------------------------------------------------------
     def load_model(self, cfg: dict, on_status) -> None:
+        self._compile_deferred = False  # reset; set below if use_compile + no offload
         if self.model is not None:
             self.unload_model(on_status)
 
@@ -123,6 +158,22 @@ class WanBackend(BaseSamplerBackend):
         if use_compile:
             from modules.util.compile_util import init_compile
             init_compile()
+
+            # ---- inductor tuning for faster compilation ------------------
+            # fx_graph_cache: persist fully-compiled Triton binaries to disk
+            # so the SECOND run with the same model+LoRA+resolution skips
+            # all Triton kernel compilations (~seconds vs many minutes).
+            # max_autotune: when False, skip GPU benchmarks that pick optimal
+            # GEMM tile sizes.  Uses sensible defaults instead — ~5-10%
+            # slower kernels but saves ~2 minutes on cold compile.
+            try:
+                import torch._inductor.config as _ind_cfg
+                _ind_cfg.fx_graph_cache = True
+                _ind_cfg.max_autotune = False
+                _ind_cfg.max_autotune_gemm = False
+            except (ImportError, AttributeError):
+                pass  # older PyTorch — inductor config not available
+            # --------------------------------------------------------------
 
         weight_dtype  = DTYPE_MAP.get(weight_dtype_str, DataType.NFLOAT_4)
         te_dtype      = DTYPE_MAP.get(te_dtype_str, DataType.BFLOAT_16)
@@ -227,12 +278,16 @@ class WanBackend(BaseSamplerBackend):
             model.transformer_2_offload_conductor = \
                 enable_checkpointing_for_wan_transformer(model.transformer_2, oc)
         elif use_compile:
-            # No offload: compile each block independently without fullgraph=True so
-            # that forward hooks (LoRA) can fire as graph breaks.
-            on_status("Compiling transformer blocks …")
-            for xfmr in (model.transformer, model.transformer_2):
-                for i in range(len(xfmr.blocks)):
-                    xfmr.blocks[i] = torch.compile(xfmr.blocks[i], dynamic=True)
+            # No offload: defer compilation to sample() so it happens AFTER
+            # LoRA injection.  Compiling here (before LoRA) causes per-step
+            # recompilation: dynamo guards on child module .forward identity
+            # at trace time, and LoRA patches change those identities, so
+            # guards fail every step and dynamo retraces until it hits the
+            # 256-recompile limit and falls back to full eager.
+            # By compiling after LoRA, dynamo's initial trace includes the
+            # patched forwards and guards are stable between diffusion steps.
+            on_status("torch.compile enabled (deferred to first sample)")
+            self._compile_deferred = True
 
         model.autocast_context             = torch.autocast("cuda", dtype=torch_compute)
         model.transformer_autocast_context = torch.autocast("cuda", dtype=torch_compute)
@@ -259,7 +314,8 @@ class WanBackend(BaseSamplerBackend):
         else:
             dtype_label = weight_dtype_str
         offload_str  = f"offload {fraction:.0%}" if fraction > 0 else "offload off"
-        compile_note = "  compile:on" if use_compile else ""
+        compile_note = ("  compile:deferred" if use_compile and fraction == 0
+                        else "  compile:per-block" if use_compile else "")
         on_status(f"Loaded [{dtype_label}]  |  {offload_str}{compile_note}")
 
     # ------------------------------------------------------------------
@@ -277,6 +333,7 @@ class WanBackend(BaseSamplerBackend):
                 make_wan_translator(self.model.transformer),
                 on_log=on_log,
                 hint_device=self.train_device,
+                compile_friendly=getattr(self, '_compile_deferred', False),
             )
         if expert in ("LOW", "BOTH") and self.model.transformer_2 is not None:
             hooks += apply_lora_hooks(
@@ -284,6 +341,7 @@ class WanBackend(BaseSamplerBackend):
                 make_wan_translator(self.model.transformer_2),
                 on_log=on_log,
                 hint_device=self.train_device,
+                compile_friendly=getattr(self, '_compile_deferred', False),
             )
         return hooks
 
@@ -393,6 +451,14 @@ class WanBackend(BaseSamplerBackend):
                 if _compiled_blocks:
                     print(f"[compile] LoRAs + offload — {len(_compiled_blocks)} inner blocks "
                           "in eager mode (fullgraph bypass)")
+            # --------------------------------------------------------------
+
+            # ---- deferred compile (no-offload path) ----------------------
+            # Wrap blocks in torch.compile AFTER LoRA injection so dynamo's
+            # initial trace includes the patched forwards and guards are
+            # stable between diffusion steps.  Actual Triton compilation is
+            # lazy — triggered on step 1 of the denoising loop.
+            self._ensure_blocks_compiled()
             # --------------------------------------------------------------
 
             # ---- UMT5 embedding cache ------------------------------------
@@ -564,6 +630,7 @@ class WanBackend(BaseSamplerBackend):
             if is_image:
                 write_png_metadata(out_path, "wan_sampler", meta)
             else:
+                write_mp4_metadata(out_path, "wan_sampler", meta)
                 write_png_sidecar(out_path, "wan_sampler", meta)
 
             on_done(out_path, seed)

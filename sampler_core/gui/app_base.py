@@ -27,6 +27,14 @@ from sampler_core.util.resolution import check_attn_backends
 from sampler_core.gui.tooltip import Tooltip  # noqa: F401 — re-exported for subclasses
 from sampler_core.gui.theme import apply_dark_theme, BG, BG_INPUT, FG, BG_WIDGET, FG_DIM
 
+# Optional drag-and-drop support (requires tkinterdnd2 and a TkinterDnD.Tk root).
+try:
+    import tkinterdnd2 as _tkdnd
+    _DND_AVAILABLE = True
+except ImportError:
+    _tkdnd = None
+    _DND_AVAILABLE = False
+
 
 def _load_video_frames(path: str) -> tuple[list, float]:
     """
@@ -95,6 +103,9 @@ class BaseSamplerApp(ABC):
         self._log_lines: list[str] = []
         self._log_win:  tk.Toplevel | None = None
         self._log_text: ScrolledText | None = None
+
+        # Prompt Library window (singleton)
+        self._lib_win: tk.Toplevel | None = None
 
         self._queue: list[dict] = []
         self._queue_running        = False
@@ -223,6 +234,14 @@ class BaseSamplerApp(ABC):
                 "T5 token count for the positive prompt.\n\n"
                 "Counted using the loaded model's tokenizer;\n"
                 "falls back to downloading the T5 vocab if no model is loaded.")
+
+        self._lib_btn = ttk.Button(gen_frame, text="Library…", width=9,
+                                   command=self._open_library_window)
+        self._lib_btn.grid(row=r, column=7, sticky="nw", padx=(0, 6))
+        Tooltip(self._lib_btn,
+                "Open the Prompt Library window.\n\n"
+                "Save, browse, search, and reuse positive/negative prompt pairs.\n"
+                "Entries can be filtered by model.")
 
         r += 1
         ttk.Label(gen_frame, text="Negative:").grid(row=r, column=0, sticky="nw", **pad)
@@ -416,9 +435,19 @@ class BaseSamplerApp(ABC):
     def _build_right_panel(self, pad: dict) -> None:
         """Build the image preview and run-details panel (right column)."""
 
+        # Vertical paned window so preview and details both stay visible
+        # regardless of image aspect ratio.  User can drag the sash.
+        _vpaned = tk.PanedWindow(
+            self._right_frame, orient=tk.VERTICAL,
+            sashwidth=5, sashrelief="flat",
+            background=BG, bd=0,
+        )
+        _vpaned.pack(fill="both", expand=True)
+
         # ---- Preview -----------------------------------------------
-        preview_frame = ttk.LabelFrame(self._right_frame, text="Preview")
-        preview_frame.pack(fill="both", expand=True, **pad)
+        preview_frame = ttk.LabelFrame(_vpaned, text="Preview")
+        _vpaned.add(preview_frame, stretch="always", minsize=120,
+                    padx=pad["padx"], pady=pad["pady"])
 
         self._preview_container = tk.Frame(preview_frame, background=BG)
         self._preview_container.pack(fill="both", expand=True, padx=2, pady=2)
@@ -431,6 +460,25 @@ class BaseSamplerApp(ABC):
             font=("TkDefaultFont", 10),
             cursor="hand2",
         )
+        # Load File / DnD toolbar — packed first so it appears above the image
+        _lf_row = tk.Frame(self._preview_container, background=BG)
+        _lf_row.pack(side="top", fill="x")
+        _lf_btn = ttk.Button(_lf_row, text="Load File…",
+                             command=self._load_file_dialog)
+        _lf_btn.pack(side="left", padx=4, pady=2)
+        Tooltip(_lf_btn,
+                "Load a PNG, MP4, or ComfyUI JSON to preview and extract prompts.\n\n"
+                "Supports: OneTrainer sampler outputs (our metadata), ComfyUI PNGs,\n"
+                "and ComfyUI JSON workflow files.\n"
+                "Drag-and-drop also works if tkinterdnd2 is installed.")
+        if not _DND_AVAILABLE:
+            tk.Label(
+                _lf_row,
+                text="(install tkinterdnd2 for drag-and-drop)",
+                background=BG, foreground=FG_DIM,
+                font=("TkDefaultFont", 7),
+            ).pack(side="left", padx=(0, 4))
+
         self._preview_label.pack(fill="both", expand=True)
         self._preview_label.bind("<Button-1>", lambda _: self._open_output())
 
@@ -438,6 +486,13 @@ class BaseSamplerApp(ABC):
         self._preview_photo   = None   # ImageTk reference kept to prevent GC
 
         self._preview_container.bind("<Configure>", self._on_preview_resize)
+
+        # Drag-and-drop registration (requires TkinterDnD.Tk root)
+        if _DND_AVAILABLE:
+            self._preview_container.drop_target_register(_tkdnd.DND_FILES)
+            self._preview_container.dnd_bind("<<Drop>>", self._on_file_drop)
+            self._preview_label.drop_target_register(_tkdnd.DND_FILES)
+            self._preview_label.dnd_bind("<<Drop>>", self._on_file_drop)
 
         # ---- Video player controls (hidden until a video is loaded) ----
         self._video_ctrl_bar = tk.Frame(preview_frame, background=BG)
@@ -464,8 +519,9 @@ class BaseSamplerApp(ABC):
         self._video_ctrl_bar.pack_forget()   # shown only for video output
 
         # ---- Run details -------------------------------------------
-        details_frame = ttk.LabelFrame(self._right_frame, text="Run Details")
-        details_frame.pack(fill="x", **pad)
+        details_frame = ttk.LabelFrame(_vpaned, text="Run Details")
+        _vpaned.add(details_frame, stretch="never", minsize=210,
+                    padx=pad["padx"], pady=pad["pady"])
 
         self._detail_vars: dict[str, tk.StringVar] = {}
         _scalar_fields = [
@@ -515,6 +571,28 @@ class BaseSamplerApp(ABC):
         )
 
         details_frame.columnconfigure(1, weight=1)
+
+        r += 1
+        use_row = ttk.Frame(details_frame)
+        use_row.grid(row=r, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 4))
+        self._use_pos_btn = ttk.Button(use_row, text="← Use Positive",
+                                       command=self._use_detail_positive,
+                                       state="disabled")
+        self._use_pos_btn.pack(side="left", padx=(0, 4))
+        Tooltip(self._use_pos_btn,
+                "Copy the positive prompt shown in Run Details\nto the main Prompt field.")
+        self._use_neg_btn = ttk.Button(use_row, text="← Use Negative",
+                                       command=self._use_detail_negative,
+                                       state="disabled")
+        self._use_neg_btn.pack(side="left", padx=(0, 4))
+        Tooltip(self._use_neg_btn,
+                "Copy the negative prompt shown in Run Details\nto the main Negative field.")
+        self._use_both_btn = ttk.Button(use_row, text="← Use Both",
+                                        command=self._use_detail_both,
+                                        state="disabled")
+        self._use_both_btn.pack(side="left")
+        Tooltip(self._use_both_btn,
+                "Copy both prompts from Run Details to the main prompt fields.")
 
     # ------------------------------------------------------------------
     def _on_preview_resize(self, event=None) -> None:
@@ -663,6 +741,130 @@ class BaseSamplerApp(ABC):
             widget.delete("1.0", "end")
             widget.insert("1.0", cfg.get(key, ""))
             widget.config(state="disabled")
+
+        has_prompt = bool(
+            cfg.get("prompt", "").strip() or cfg.get("negative_prompt", "").strip()
+        )
+        _state = "normal" if has_prompt else "disabled"
+        for btn in (self._use_pos_btn, self._use_neg_btn, self._use_both_btn):
+            btn.config(state=_state)
+
+    # ------------------------------------------------------------------
+    # Prompt Library
+    # ------------------------------------------------------------------
+
+    def _open_library_window(self) -> None:
+        """Open (or raise) the Prompt Library window."""
+        if self._lib_win is not None:
+            try:
+                self._lib_win.lift()
+                self._lib_win.focus_force()
+                return
+            except tk.TclError:
+                pass
+        from sampler_core.gui.prompt_library import PromptLibraryWindow
+        lib = PromptLibraryWindow(self.root, self)
+        self._lib_win = lib.window
+
+    # ------------------------------------------------------------------
+    # File load / drag-and-drop
+    # ------------------------------------------------------------------
+
+    def _on_file_drop(self, event) -> None:
+        """Handle a tkinterdnd2 ``<<Drop>>`` event on the preview panel."""
+        import re
+        # tkinterdnd2 wraps paths with spaces in {braces}; multiple files are
+        # space-separated.  We process only the first dropped file.
+        raw = event.data.strip()
+        paths = re.findall(r'\{[^}]+\}|[^\s]+', raw)
+        paths = [p.strip("{}") for p in paths]
+        if paths:
+            self._load_file(paths[0])
+
+    def _load_file_dialog(self) -> None:
+        """Open a file-chooser dialog and load the selected file."""
+        path = filedialog.askopenfilename(
+            title="Load file for preview",
+            filetypes=[
+                ("Supported files", "*.png *.mp4 *.json"),
+                ("PNG images",      "*.png"),
+                ("MP4 video",       "*.mp4"),
+                ("ComfyUI JSON",    "*.json"),
+                ("All files",       "*.*"),
+            ],
+        )
+        if path:
+            self._load_file(path)
+
+    def _load_file(self, path: str) -> None:
+        """Parse *path* and display its content in the preview + run details."""
+        from sampler_core.util.file_import import load_sampler_file
+        result = load_sampler_file(path)
+        if result is None:
+            messagebox.showwarning(
+                "Unsupported file",
+                f"Could not read metadata from:\n{path}",
+            )
+            return
+        display = result.get("display_path")
+        params  = result.get("params")
+        if display:
+            self._update_right_panel(display, params)
+        elif params:
+            # JSON-only (ComfyUI workflow — no image to display)
+            self._stop_video_playback()
+            self._video_ctrl_bar.pack_forget()
+            self._preview_pil_img = None
+            self._preview_label.config(image="", text="(JSON workflow — no image)")
+            self._populate_detail_from_params(params)
+
+    def _populate_detail_from_params(self, params: dict) -> None:
+        """Fill the Run Details panel from a params dict (no file path needed)."""
+        self._detail_vars["file"].set("(imported)")
+        self._detail_vars["seed"].set(str(params.get("seed", "—")))
+        w, h = params.get("width", 0), params.get("height", 0)
+        self._detail_vars["res"].set(f"{w} × {h}" if w and h else "—")
+        steps = params.get("steps", "—")
+        self._detail_vars["steps"].set(str(steps))
+        self._detail_vars["cfg"].set(str(params.get("cfg_scale", "—")))
+        sched = params.get("scheduler", "—")
+        shift = params.get("sigma_shift")
+        self._detail_vars["sampler"].set(
+            f"{sched}  σ={shift}" if sched and shift is not None else str(sched)
+        )
+        for widget, key in (
+            (self._detail_prompt_text, "prompt"),
+            (self._detail_neg_text,    "negative_prompt"),
+        ):
+            widget.config(state="normal")
+            widget.delete("1.0", "end")
+            widget.insert("1.0", params.get(key, ""))
+            widget.config(state="disabled")
+        has_prompt = bool(
+            params.get("prompt", "").strip() or params.get("negative_prompt", "").strip()
+        )
+        _state = "normal" if has_prompt else "disabled"
+        for btn in (self._use_pos_btn, self._use_neg_btn, self._use_both_btn):
+            btn.config(state=_state)
+
+    # ------------------------------------------------------------------
+    # Use-prompt helpers (copy Run Details → main prompt fields)
+    # ------------------------------------------------------------------
+
+    def _use_detail_positive(self) -> None:
+        text = self._detail_prompt_text.get("1.0", "end-1c")
+        self._prompt_text.delete("1.0", "end")
+        self._prompt_text.insert("1.0", text)
+        self._schedule_token_count()
+
+    def _use_detail_negative(self) -> None:
+        text = self._detail_neg_text.get("1.0", "end-1c")
+        self._neg_text.delete("1.0", "end")
+        self._neg_text.insert("1.0", text)
+
+    def _use_detail_both(self) -> None:
+        self._use_detail_positive()
+        self._use_detail_negative()
 
     # ==================================================================
     # Shared blink / status / busy
@@ -985,7 +1187,9 @@ class BaseSamplerApp(ABC):
                             spi = (now - _t0[0]) / steps_done
                             remaining = int((t - step) * spi)
                             m, s_rem = divmod(remaining, 60)
-                            label = f"{step}/{t}  {spi:.1f}s/it  ETA {m}:{s_rem:02d}"
+                            rate_str = (f"{1/spi:.2f}it/s" if spi < 1
+                                        else f"{spi:.1f}s/it")
+                            label = f"{step}/{t}  {rate_str}  ETA {m}:{s_rem:02d}"
                         else:
                             label = f"{step}/{t}"
                         # Establish baseline from first post-warmup step (step 2+).
@@ -1040,7 +1244,12 @@ class BaseSamplerApp(ABC):
                     # Post elapsed time and average s/it to the tree entry.
                     _m, _s_rem = divmod(int(_sample_elapsed), 60)
                     _time_str = f"{_m}:{_s_rem:02d}" if _m else f"{int(_sample_elapsed)}s"
-                    _spi_str  = f"{_sample_elapsed / total:.1f}" if total > 0 else ""
+                    if total > 0:
+                        _spi = _sample_elapsed / total
+                        _spi_str = (f"{1/_spi:.2f}it/s" if _spi < 1
+                                    else f"{_spi:.1f}s/it")
+                    else:
+                        _spi_str = ""
                     self.root.after(0, self._queue_update_timing,
                                     job["iid"], _time_str, _spi_str)
                     self.root.after(0, self._on_queue_job_done, done_path[0], cfg)
@@ -1060,6 +1269,15 @@ class BaseSamplerApp(ABC):
         self._out_path_var.set(path)
         self._progress["value"] = self._progress["maximum"]
         self._update_right_panel(path, cfg)
+        if cfg and (cfg.get("prompt", "").strip() or cfg.get("negative_prompt", "").strip()):
+            cls = type(self).__name__
+            model = ("Wan 2.2 T2V-A14B" if "Wan" in cls
+                     else "Chroma" if "Chroma" in cls else "All")
+            try:
+                from sampler_core.gui.prompt_library import auto_save_prompt
+                auto_save_prompt(cfg.get("prompt", ""), cfg.get("negative_prompt", ""), model)
+            except Exception:
+                pass
 
     # ==================================================================
     # Token counter
@@ -1192,6 +1410,12 @@ class BaseSamplerApp(ABC):
         self.backend.cancel()
         self._stop_blink()
         self._stop_video_playback()
+        if self._lib_win is not None:
+            try:
+                self._lib_win.destroy()
+            except tk.TclError:
+                pass
+            self._lib_win = None
         self._save_cfg()
 
     def _on_close(self) -> None:

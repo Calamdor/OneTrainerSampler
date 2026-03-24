@@ -6,34 +6,38 @@ apply_lora_hooks() is the single entry point.  Each model provides a
 
 For non-quantized linear layers (BF16/FP16/FP32 weight), the LoRA delta is
 merged directly into the weight tensor — zero per-step overhead.  Quantized
-layers (NF4, W4A16, GGUF, …) use forward method patching: the module's
-.forward is replaced with a wrapper that calls the original forward and adds
-the LoRA delta.
+layers (NF4, W4A16, GGUF, …) use one of two strategies:
+
+  1. GGUF compile-friendly path (compile_friendly=True):
+     Inspired by ComfyUI-GGUF (city96): dequantize weight on-the-fly,
+     merge LoRA onto the dequantized float, call F.linear.  LoRA factors
+     stored as module attributes (not closure variables) so torch.compile
+     guards are stable and persistent disk cache works across sessions.
+     The dequant call is a single graph break; LoRA merge + F.linear are
+     fused in the compiled graph.
+
+  2. Forward-patch path (compile_friendly=False, legacy):
+     Replaces module.forward with a wrapper closure.  Works but closures
+     have per-session Python identity, breaking persistent compile cache.
 
 Method patching is used instead of register_forward_hook because:
   - torch.compile(fullgraph=True) on a parent block bypasses post-forward
     hooks on child modules (hooks fire outside the traced graph).
-  - Method patching is traceable: dynamo inlines `patched` and compiles the
-    LoRA delta (F.linear × 2 + scale) as part of the block graph, fusing it
-    with surrounding ops.  Only the base-layer kernel (GGUF/NF4) is an
-    opaque graph break via torch.compiler.disable(orig_fwd).
-  - Guard stability: `_disabled_orig` has a stable Python identity for the
-    lifetime of one LoRA apply; dynamo never traverses into orig_fwd's own
-    closure chain.  One retrace on first LoRA apply; zero thereafter.
+  - Method patching is traceable by dynamo.
 
-IMPORTANT — removal order: _ForwardPatch.remove() must be called in reverse
-application order when multiple LoRAs target the same layer.  BaseSamplerBackend
+IMPORTANT — removal order: handles must be removed in reverse application
+order when multiple LoRAs target the same layer.  BaseSamplerBackend
 .remove_loras() iterates reversed(self.lora_hooks) to guarantee this.
 
-Both paths return objects with a .remove() method so BaseSamplerBackend's
-remove_loras() works identically for both.
+All paths return objects with a .remove() method so BaseSamplerBackend's
+remove_loras() works identically for all.
 """
 import torch
 import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# Weight-merge path
+# Weight-merge path (float layers — zero per-step cost)
 # ---------------------------------------------------------------------------
 
 class _WeightMerge:
@@ -79,7 +83,125 @@ def _can_merge(module: torch.nn.Module) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Forward patch path
+# GGUF compile-friendly path (ComfyUI-style dequant → merge → F.linear)
+# ---------------------------------------------------------------------------
+
+def _is_gguf_module(module: torch.nn.Module) -> bool:
+    """Check if module uses GGUF quantized weights (has quant_type on weight)."""
+    w = getattr(module, "weight", None)
+    return w is not None and hasattr(w, "quant_type")
+
+
+def _gguf_dequant_weight(weight):
+    """Dequantize a GGUF weight tensor.
+
+    Uses the gguf library's dequantize_gguf_tensor, wrapped in
+    torch.compiler.disable so it's a clean, single graph break.
+    The LoRA merge and F.linear that follow are fully compiled.
+    """
+    from diffusers.quantizers.gguf.utils import dequantize_gguf_tensor
+    return dequantize_gguf_tensor(weight.detach())
+
+
+# Wrap at definition time so the decorator object has stable identity
+_gguf_dequant_weight = torch.compiler.disable(_gguf_dequant_weight)
+
+
+def _gguf_compile_forward(self, x):
+    """Compile-friendly forward for GGUF modules with LoRA.
+
+    Bound to modules as an unbound function via types.MethodType so it
+    appears as a regular method — no closure variables for dynamo to guard on.
+
+    Flow:
+      1. Dequantize GGUF weight → float (graph break — one per linear)
+      2. Merge all LoRA factors onto dequantized weight (compiled, pure torch)
+      3. Int8 quantize-matmul-dequantize (compiled, same speed as original A8I)
+
+    The int8 path (quantize merged weight + input to int8, _int_mm, rescale)
+    matches LinearGGUFIntA8RequantFunction but uses only standard torch ops —
+    no custom autograd Function, so torch.compile traces through cleanly.
+    """
+    # Graph break: dequant GGUF → float
+    w = _gguf_dequant_weight(self.weight)
+    dt = self._gguf_compile_dt
+    w = w.to(dtype=dt)
+
+    # Compiled: merge LoRA factors (stored as module attributes)
+    for dv, uv, s in self._lora_factors:
+        # uv @ dv: [out_dim, rank] @ [rank, in_dim] → [out_dim, in_dim]
+        w = w + (uv @ dv) * s
+
+    # Compiled: int8 quantized matmul (same as original A8I path)
+    # All ops are standard torch — _int_mm is a built-in ATen op.
+    bias = self.bias
+    if bias is not None:
+        bias = bias.to(dtype=dt)
+
+    x_2d = x.reshape(-1, x.shape[-1])
+
+    # Quantize input to int8 (per-row scaling)
+    x_absmax = x_2d.abs().amax(dim=-1, keepdim=True).clamp_(min=1e-7)
+    x_scale = x_absmax.mul_(1.0 / 127.0)
+    x_8 = x_2d.div(x_scale).round_().to(torch.int8)
+
+    # Quantize merged weight to int8 (per-row scaling)
+    w_absmax = w.abs().amax(dim=-1, keepdim=True).clamp_(min=1e-7)
+    w_scale = w_absmax.mul_(1.0 / 127.0)
+    w_8 = w.div(w_scale).round_().to(torch.int8)
+
+    # Int8 matmul → rescale to compute dtype
+    y = torch._int_mm(x_8, w_8.t())
+    y = y.float().mul_(w_scale.t()).mul_(x_scale).to(dtype=dt)
+    if bias is not None:
+        y = y.add_(bias)
+
+    return y.reshape(x.shape[:-1] + (y.shape[-1],))
+
+
+class _GGUFCompilePatch:
+    """Compile-friendly LoRA patch for GGUF modules.
+
+    Replaces forward with dequant → merge → int8 matmul.  LoRA factors stored
+    as module attributes (_lora_factors) — NOT closure variables — so
+    torch.compile guards are based on stable module structure, and persistent
+    disk cache works across app restarts.
+
+    One handle is created per module (first LoRA).  Subsequent LoRAs on the
+    same module get a lightweight _GGUFFactorRef handle.  remove() on the
+    primary handle restores the original forward and cleans up all factors.
+    """
+    __slots__ = ("_module", "_orig_forward")
+
+    def __init__(self, module: torch.nn.Module, orig_forward):
+        self._module = module
+        self._orig_forward = orig_forward
+
+    def remove(self) -> None:
+        self._module.forward = self._orig_forward
+        for attr in ('_lora_factors', '_gguf_compile_dt'):
+            try:
+                delattr(self._module, attr)
+            except AttributeError:
+                pass
+
+
+class _GGUFFactorRef:
+    """Lightweight handle for additional LoRAs on an already-patched GGUF module.
+
+    The primary _GGUFCompilePatch handle manages forward restoration.
+    This ref exists so that BaseSamplerBackend.apply_loras() gets a non-empty
+    handle list per LoRA (preventing the '0 handles' warning).
+    remove() is a no-op — cleanup is handled by _GGUFCompilePatch.remove().
+    """
+    __slots__ = ()
+
+    def remove(self) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Forward patch path (legacy — for non-GGUF quantized modules)
 # ---------------------------------------------------------------------------
 
 class _ForwardPatch:
@@ -137,6 +259,7 @@ def apply_lora_hooks(
         key_translator,
         on_log=None,
         hint_device: torch.device | None = None,
+        compile_friendly: bool = False,
 ) -> list:
     """
     Inject a LoRA into `transformer` and/or `text_encoder`.
@@ -144,17 +267,19 @@ def apply_lora_hooks(
     For each target module:
       - If the weight is a plain float tensor (BF16/FP16/FP32): merge the
         LoRA delta directly into the weight (fast path, zero per-step cost).
-      - Otherwise: patch module.forward with a wrapper that calls the original
-        forward and adds the LoRA delta (compile-safe; one retrace on apply/remove).
+      - If compile_friendly=True and module is GGUF: use dequant → merge →
+        F.linear path (ComfyUI-style, no graph breaks from LoRA).
+      - Otherwise: patch module.forward with a closure wrapper.
 
     key_translator(stripped_key: str) -> (target: str, module_path: str) | None
       target is 'transformer' or 'text_encoder'.
       Return None to skip the key.
 
-    Returns a list of _WeightMerge / _ForwardPatch objects; call .remove() on
-    each to undo.  BaseSamplerBackend.remove_loras() does this automatically
-    in reversed order (required for correct _ForwardPatch unwinding).
+    Returns a list of handle objects; call .remove() on each to undo.
+    BaseSamplerBackend.remove_loras() does this in reversed order.
     """
+    import types
+
     # Group keys into {(target, mod_path): {down, up, alpha}}
     loras: dict[tuple[str, str], dict] = {}
     for key, tensor in state_dict.items():
@@ -180,6 +305,7 @@ def apply_lora_hooks(
     fail_count = 0
     merge_count = 0
     hook_count = 0
+    gguf_count = 0
 
     for (target, mod_path), lora in loras.items():
         if "down" not in lora or "up" not in lora:
@@ -199,8 +325,6 @@ def apply_lora_hooks(
         u = lora["up"].float().cpu()    # [out_dim, rank]
 
         # Dimension guard: skip if the LoRA output dim doesn't match the module.
-        # This catches LoRAs trained on a different model variant (different hidden
-        # dim / mlp ratio) — applying them would crash torch.compile shape tracing.
         mod_out_dim = getattr(getattr(module, "weight", None), "shape", (None,))[0]
         if mod_out_dim is not None and u.shape[0] != mod_out_dim:
             fail_count += 1
@@ -208,46 +332,46 @@ def apply_lora_hooks(
 
         if _can_merge(module):
             # ---- Fast path: merge delta directly into weights ----------------
-            # Compute delta on the fly and apply; store only the small factors.
             w = module.weight
             w.data.add_((scale * (u @ d)).to(device=w.device, dtype=w.dtype))
             handles.append(_WeightMerge(module, d, u, scale))
             merge_count += 1
+
+        elif compile_friendly and _is_gguf_module(module):
+            # ---- GGUF compile-friendly path ----------------------------------
+            # ComfyUI-style: dequant → merge LoRA → F.linear.
+            # LoRA factors stored as module attributes, not closure variables.
+            # One graph break per linear (dequant), LoRA merge + F.linear compiled.
+            dev = hint_device or torch.device("cuda")
+            dt = getattr(module, "compute_dtype", None) or torch.bfloat16
+
+            if not hasattr(module, '_lora_factors'):
+                # First LoRA on this module: set up compile-friendly forward
+                orig_fwd = module.forward
+                module._lora_factors = []
+                module._gguf_compile_dt = dt
+                module.forward = types.MethodType(_gguf_compile_forward, module)
+                handles.append(_GGUFCompilePatch(module, orig_fwd))
+            else:
+                # Additional LoRA on same module: lightweight ref handle
+                handles.append(_GGUFFactorRef())
+
+            dv = d.to(device=dev, dtype=dt)
+            uv = u.to(device=dev, dtype=dt)
+            module._lora_factors.append((dv, uv, scale))
+            gguf_count += 1
+
+            if gguf_count == 1 and on_log:
+                on_log(f"[LoRA] GGUF compile-friendly: device={dev} dtype={dt}")
+
         else:
-            # ---- Fallback: forward method patch (compile-safe) ----------------
-            # Replaces module.forward with a wrapper that calls the original
-            # forward and adds the LoRA delta from the same input tensor x.
-            # dv/uv are pre-moved to the module's device+dtype at injection
-            # time — the patched forward is unconditional and contains no
-            # mutable closed-over state, so torch.compile can trace it cleanly.
-            #
-            # Why not register_forward_hook:
-            #   torch.compile(fullgraph=True) on the parent transformer block
-            #   inlines child module calls and silently bypasses post-forward
-            #   hooks.  Method patching is visible to the compiler and allows
-            #   the delta computation to be fused into the compiled graph after
-            #   one retrace.  dynamic=True blocks also benefit: graph breaks
-            #   disappear, replaced by a single guard-based retrace on apply/remove.
+            # ---- Fallback: forward method patch (closure-based) ----------------
             def _make_patch(orig_fwd, down, up, s, mod, hint_dev):
-                # Resolve device and dtype at injection time so the patched
-                # forward contains no Python-level conditionals or mutable
-                # closed-over state.  Any Python dict/conditional inside a
-                # compiled function causes torch.compile to re-guard on every
-                # call, triggering a recompile loop when the dict mutates on
-                # the first call (cache miss).
-                #
-                # Device: use the weight's device if it is a float (i.e. a
-                #   real compute device).  GGUF weights live on CPU even when
-                #   inference runs on CUDA — in that case fall back to
-                #   hint_dev (self.train_device passed from the backend).
-                # Dtype:  LinearGGUFA8 stores compute_dtype (set by
-                #   _ot_quantize_layers).  Other quantized layers fall back
-                #   to bfloat16 (safe for all Chroma/Wan dtypes).
                 w   = getattr(mod, "weight", None)
                 if w is not None and w.dtype.is_floating_point:
-                    dev = w.device          # float weight → real compute device
+                    dev = w.device
                 elif hint_dev is not None:
-                    dev = hint_dev          # GGUF/quantized → use backend hint
+                    dev = hint_dev
                 else:
                     dev = torch.device("cpu")
                 dt  = getattr(mod, "compute_dtype", None)
@@ -256,26 +380,9 @@ def apply_lora_hooks(
                           else torch.bfloat16)
                 dv = down.to(device=dev, dtype=dt)
                 uv = up.to(device=dev, dtype=dt)
-                # Disable compilation on patched so dynamo never traverses
-                # orig_fwd's closure chain to build identity guards.  Without
-                # this, dynamo guards on inner cell contents of orig_fwd (which
-                # is itself a closure for GGUF/quantised layers); those cells
-                # change identity on every LoRA re-apply, accumulating to the
-                # 256-recompile limit and then falling back to full eager.
-                #
-                # Note: disabling only orig_fwd (not patched) does NOT help —
-                # dynamo propagates the disable status upward through any closure
-                # that captures a disabled callable, ending up treating patched
-                # as disabled anyway.  Disabling patched directly is simpler and
-                # produces the same graph-break structure.
-                #
-                # Guard stability: the compiled block guards on patched's object
-                # identity (stable for the lifetime of this apply); loras_current()
-                # prevents redundant remove+reapply so the guard only fails once
-                # per intentional LoRA change.
                 def patched(x):
                     return orig_fwd(x) + F.linear(F.linear(x, dv), uv) * s
-                return torch.compiler.disable(patched)
+                return patched
 
             orig = module.forward
             patch = _make_patch(orig, d, u, scale, module, hint_device)
@@ -283,7 +390,6 @@ def apply_lora_hooks(
             handles.append(_ForwardPatch(module, orig))
             hook_count += 1
             if hook_count == 1 and on_log:
-                # Log the resolved device+dtype once (all layers use the same).
                 w2   = getattr(module, "weight", None)
                 dev2 = (w2.device if (w2 is not None and w2.dtype.is_floating_point)
                         else hint_device or "cpu")
@@ -293,11 +399,9 @@ def apply_lora_hooks(
                 on_log(f"[LoRA] patch device={dev2} dtype={dt2}")
 
     # ---- Logging -------------------------------------------------------
-    # on_log is already _status (prints + GUI) when called from apply_loras.
-    # Fall back to plain print when called standalone.
     _log = on_log if on_log is not None else print
     total_parsed = len(loras)
-    ok_count = merge_count + hook_count
+    ok_count = merge_count + hook_count + gguf_count
     if total_parsed == 0:
         _log("[LoRA] no LoRA entries parsed — check key format")
         for k in list(state_dict.keys())[:8]:
@@ -307,10 +411,8 @@ def apply_lora_hooks(
              f"({total_parsed} entries parsed)")
         for k in list(state_dict.keys())[:8]:
             _log(f"  key: {k}")
-        # Show the translated module paths being looked up (first 4)
         for (tgt, mod_path), _ in list(loras.items())[:4]:
             _log(f"  lookup: {tgt}:{mod_path}")
-        # Show model modules relevant to attention / blocks
         if transformer is not None:
             relevant = [
                 n for n, _ in transformer.named_modules()
@@ -323,6 +425,8 @@ def apply_lora_hooks(
         parts = []
         if merge_count:
             parts.append(f"{merge_count} weight-merged")
+        if gguf_count:
+            parts.append(f"{gguf_count} gguf-compile")
         if hook_count:
             parts.append(f"{hook_count} forward-patched")
         if skipped:
