@@ -38,7 +38,8 @@ A standalone image/video sampler GUI for [OneTrainer](https://github.com/Nerogar
 
 ## Requirements
 
-- [OneTrainer](https://github.com/Nerogar/OneTrainer) installed in an adjacent directory (`../OneTrainer/`) with its virtual environment set up
+- **Chroma:** [OneTrainer](https://github.com/Nerogar/OneTrainer) (`main` branch) installed in an adjacent directory (`../OneTrainer/`) with its virtual environment set up
+- **Wan 2.2:** requires the WIP [feature/wan2.2-t2v-a14b](https://github.com/Calamdor/OneTrainer/tree/feature/wan2.2-t2v-a14b) branch of OneTrainer — Wan support has not yet been merged to upstream main
 - Python packages from the OneTrainer venv (PyTorch, diffusers, transformers, Pillow, etc.)
 
 ### Optional
