@@ -103,6 +103,24 @@ class BaseSamplerApp(ABC):
         self._log_lines: list[str] = []
         self._log_win:  tk.Toplevel | None = None
         self._log_text: ScrolledText | None = None
+        
+        # Redirect print() to log window for debug output
+        import sys
+        class _LogRedirect:
+            def __init__(self, logger):
+                self.logger = logger
+            def write(self, msg):
+                if msg.strip():
+                    self.logger._append_log(msg.rstrip())
+            def flush(self):
+                pass
+        
+        # Save original stdout/stderr for error traceback printing
+        self._orig_stdout = sys.stdout
+        self._orig_stderr = sys.stderr
+        
+        sys.stdout = _LogRedirect(self)
+        sys.stderr = _LogRedirect(self)
 
         # Prompt Library window (singleton)
         self._lib_win: tk.Toplevel | None = None

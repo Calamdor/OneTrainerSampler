@@ -122,10 +122,9 @@ def _gguf_compile_forward(self, x):
     matches LinearGGUFIntA8RequantFunction but uses only standard torch ops —
     no custom autograd Function, so torch.compile traces through cleanly.
     """
-    # Graph break: dequant GGUF → float
     w = _gguf_dequant_weight(self.weight)
     dt = self._gguf_compile_dt
-    w = w.to(dtype=dt)
+    w = w.to(device=self._gguf_compile_dev, dtype=dt)
 
     # Compiled: merge LoRA factors (stored as module attributes)
     for dv, uv, s in self._lora_factors:
@@ -179,7 +178,7 @@ class _GGUFCompilePatch:
 
     def remove(self) -> None:
         self._module.forward = self._orig_forward
-        for attr in ('_lora_factors', '_gguf_compile_dt'):
+        for attr in ('_lora_factors', '_gguf_compile_dt', '_gguf_compile_dev'):
             try:
                 delattr(self._module, attr)
             except AttributeError:
@@ -230,7 +229,7 @@ class _ForwardPatch:
 # Module lookup helper
 # ---------------------------------------------------------------------------
 
-def get_module_by_dotpath(root: torch.nn.Module, path: str) -> torch.nn.Module:
+def get_module_by_dotpath(root: torch.nn.Module, path: str, debug_log=None) -> torch.nn.Module:
     """
     Walk `root` via dot-separated `path`, transparently unwrapping OT
     OffloadCheckpointLayer wrappers (.checkpoint attribute).
@@ -238,12 +237,26 @@ def get_module_by_dotpath(root: torch.nn.Module, path: str) -> torch.nn.Module:
     torch.compile OptimizedModule wrappers do not need special handling here:
     OptimizedModule.__getattr__ transparently delegates to _orig_mod, so
     attribute traversal through a compiled block works naturally.
+    
+    If debug_log is provided, logs the traversal path for debugging.
     """
     m = root
+    traversal_log: list[str] = []
+    if debug_log:
+        traversal_log.append(f"START: {type(root).__name__}")
     for part in path.split("."):
         m = getattr(m, part)
         if hasattr(m, "checkpoint") and isinstance(m.checkpoint, torch.nn.Module):
+            if debug_log:
+                traversal_log.append(f"  ↓ UNWRAP checkpoint: {type(m).__name__} → {type(m.checkpoint).__name__}")
             m = m.checkpoint
+        else:
+            if debug_log:
+                traversal_log.append(f"  ↓ {part}: {type(m).__name__}")
+    
+    if debug_log and len(traversal_log) > 1:
+        debug_log(f"[MODULE-LOOKUP] {path}\n  " + "\n  ".join(traversal_log))
+    
     return m
 
 
@@ -314,8 +327,10 @@ def apply_lora_hooks(
         if root is None:
             continue
         try:
-            module = get_module_by_dotpath(root, mod_path)
+            module = get_module_by_dotpath(root, mod_path, on_log)
         except AttributeError:
+            if on_log:
+                on_log(f"[MODULE-LOOKUP-FAIL] {target}:{mod_path} — AttributeError")
             fail_count += 1
             continue
 
@@ -327,6 +342,9 @@ def apply_lora_hooks(
         # Dimension guard: skip if the LoRA output dim doesn't match the module.
         mod_out_dim = getattr(getattr(module, "weight", None), "shape", (None,))[0]
         if mod_out_dim is not None and u.shape[0] != mod_out_dim:
+            if on_log:
+                on_log(f"[LoRA-DIM-FAIL] {target}:{mod_path} — LoRA up dim={u.shape[0]}, "
+                       f"module weight dim={mod_out_dim} — SKIPPED")
             fail_count += 1
             continue
 
@@ -350,6 +368,7 @@ def apply_lora_hooks(
                 orig_fwd = module.forward
                 module._lora_factors = []
                 module._gguf_compile_dt = dt
+                module._gguf_compile_dev = dev
                 module.forward = types.MethodType(_gguf_compile_forward, module)
                 handles.append(_GGUFCompilePatch(module, orig_fwd))
             else:
@@ -363,6 +382,8 @@ def apply_lora_hooks(
 
             if gguf_count == 1 and on_log:
                 on_log(f"[LoRA] GGUF compile-friendly: device={dev} dtype={dt}")
+            elif gguf_count % 50 == 0 and on_log:
+                on_log(f"[LoRA-GGUF-PROGRESS] {gguf_count} layers patched")
 
         else:
             # ---- Fallback: forward method patch (closure-based) ----------------

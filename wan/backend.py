@@ -100,9 +100,29 @@ class WanBackend(BaseSamplerBackend):
         _opt_cls = getattr(torch._dynamo, "OptimizedModule", None)
         for xfmr in (self.model.transformer, self.model.transformer_2):
             for i in range(len(xfmr.blocks)):
-                if _opt_cls is not None and isinstance(xfmr.blocks[i], _opt_cls):
+                block = xfmr.blocks[i]
+
+                # Check if this is an OffloadCheckpointLayer wrapper (offload path)
+                if hasattr(block, "checkpoint") and isinstance(block.checkpoint, torch.nn.Module):
+                    # Offload path: compile the INNER checkpoint module, not the wrapper.
+                    # The wrapper handles device transfers — cannot be compiled.
+                    inner_block = block.checkpoint
+                    if _opt_cls is not None and isinstance(inner_block, _opt_cls):
+                        continue  # already wrapped; cache was reset by remove_loras()
+
+                    # OneTrainer's create_checkpoint() calls orig_module.compile() but discards
+                    # the return value! So inner_block is still uncompiled. We need to replace
+                    # it with the compiled version.
+                    #
+                    # Do NOT compile the inner block when offload is active — see chroma/backend.py
+                    # for the full explanation. _kwargs_to_args breaks when self.checkpoint is a
+                    # compiled OptimizedModule (signature becomes *args/**kwargs, drops all args).
+                    continue
+
+                # No-offload path: direct compile (existing behavior)
+                if _opt_cls is not None and isinstance(block, _opt_cls):
                     continue  # already wrapped; cache was reset by remove_loras()
-                xfmr.blocks[i] = torch.compile(xfmr.blocks[i])
+                xfmr.blocks[i] = torch.compile(block, fullgraph=False)
 
     # ------------------------------------------------------------------
     def load_model(self, cfg: dict, on_status) -> None:
@@ -263,20 +283,21 @@ class WanBackend(BaseSamplerBackend):
 
         fraction = max(0.0, min(0.99, offload_fraction / 100.0)) if offload_enabled else 0.0
         if fraction > 0:
-            if use_compile:
-                on_status(f"Setting up layer offload ({fraction:.0%}) + compiling blocks …")
-            else:
-                on_status(f"Setting up layer offload ({fraction:.0%}) …")
-            # Pass use_compile through so OT's checkpointing wraps each block in
-            # OffloadCheckpointLayer and calls orig_module.compile(fullgraph=True).
-            # Same approach as Chroma; the LoRA+compile guard in sample() swaps
-            # compiled inner blocks to eager when LoRAs are active.
+            # Offload enabled: set up conductor for layer offloading mechanics.
+            # Do NOT pass use_compile=True — that causes create_checkpoint() to
+            # synchronously compile all blocks during model load (5+ minute warmup).
+            # Instead, let _ensure_blocks_compiled() handle deferred compilation
+            # of inner blocks after LoRA injection (same as no-offload path).
+            on_status(f"Setting up layer offload ({fraction:.0%}) …")
             oc = _OffloadConfig(self.train_device, self.temp_device, fraction,
-                                use_compile=use_compile)
+                                use_compile=False)  # ← Don't compile during checkpoint creation!
             model.transformer_offload_conductor = \
                 enable_checkpointing_for_wan_transformer(model.transformer, oc)
             model.transformer_2_offload_conductor = \
                 enable_checkpointing_for_wan_transformer(model.transformer_2, oc)
+            # Mark for deferred compilation (same flag as no-offload path)
+            if use_compile:
+                self._compile_deferred = True
         elif use_compile:
             # No offload: defer compilation to sample() so it happens AFTER
             # LoRA injection.  Compiling here (before LoRA) causes per-step
@@ -314,8 +335,11 @@ class WanBackend(BaseSamplerBackend):
         else:
             dtype_label = weight_dtype_str
         offload_str  = f"offload {fraction:.0%}" if fraction > 0 else "offload off"
-        compile_note = ("  compile:deferred" if use_compile and fraction == 0
-                        else "  compile:per-block" if use_compile else "")
+        # compile_note reflects whether compilation is deferred (fast warmup)
+        # or done synchronously per-block (slow warmup). With the optimization,
+        # both no-offload and offload paths now defer when use_compile=True.
+        compile_note = ("  compile:deferred" if use_compile
+                        else "")
         on_status(f"Loaded [{dtype_label}]  |  {offload_str}{compile_note}")
 
     # ------------------------------------------------------------------
@@ -409,7 +433,7 @@ class WanBackend(BaseSamplerBackend):
             else:
                 on_progress(step, total)
 
-        _compiled_blocks = []
+        _compile_restores = []  # (obj, saved) — restored in finally; see below
         try:
             _enum_name = ATTN_BACKEND_ENUM_NAME.get(attn_str)
             from diffusers.models.attention_dispatch import (

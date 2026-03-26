@@ -90,27 +90,50 @@ class ChromaBackend(BaseSamplerBackend):
         sessions.  The dequant call is one graph break per linear; LoRA merge
         and F.linear are fused in the compiled graph.  Expected cold compile:
         ~30-90 seconds (vs ~4 min with the old closure-based forward patches).
+
+        Offload path: inner checkpoint blocks are NOT compiled here. The offload
+        conductor uses _kwargs_to_args(self.checkpoint.forward) to convert
+        keyword args to positional before calling each block. A compiled
+        OptimizedModule's .forward has signature (*args, **kwargs), so
+        inspect.signature sees no named parameters — _kwargs_to_args silently
+        drops all arguments and the block receives an empty tuple, producing
+        shape errors at runtime. Keeping inner blocks uncompiled preserves their
+        named signatures so argument ordering works correctly.
         """
         if not getattr(self, '_compile_deferred', False):
             return
         if self.model is None:
             return
 
-        # Static shapes (dynamic=None, the default) instead of dynamic=True:
-        # - Static specializes on exact dimensions → far fewer Triton kernels
-        # - All 19 double blocks produce identical FX graphs → compile once,
-        #   cache-hit 18 times.  Same for 38 single blocks.
-        # - If resolution changes, dynamo auto-recompiles to dynamic shapes
-        #   (one extra warmup, then cache covers all future shapes).
-        # Actual compilation is lazy — triggered on first forward call
-        # (i.e., step 1 of the denoising loop).
+        # Offload path: skip all block-level compilation.
+        #
+        # When OT's create_checkpoint() runs with compile=False it patches
+        # block.forward = OffloadCheckpointLayer.forward in-place and returns
+        # the original block unchanged (not a new wrapper).  The block stays as
+        # ChromaTransformerBlock in the module list with no structural marker
+        # to distinguish it from a plain non-offload block.
+        #
+        # Compiling a forward-patched offload block causes two failure modes:
+        #   1. _kwargs_to_args inspects the compiled .forward signature
+        #      (*args, **kwargs) and silently drops all named args → block
+        #      receives empty inputs → shape errors ("1536 must match 3072").
+        #   2. Dynamo traces through OffloadCheckpointLayer.forward + GGUF
+        #      __torch_function__ with fake tensors → symbolic numel() error.
+        #
+        # When offload is active the bottleneck is VRAM transfer bandwidth, not
+        # compute, so block-level compile provides negligible benefit anyway.
+        if getattr(self.model, 'transformer_offload_conductor', None) is not None:
+            return
+
+        # No-offload path: compile each block lazily.
         _opt_cls = getattr(torch._dynamo, "OptimizedModule", None)
         for blk_list in (self.model.transformer.transformer_blocks,
                          self.model.transformer.single_transformer_blocks):
             for i in range(len(blk_list)):
-                if _opt_cls is not None and isinstance(blk_list[i], _opt_cls):
-                    continue  # already wrapped; cache was reset by remove_loras()
-                blk_list[i] = torch.compile(blk_list[i])
+                block = blk_list[i]
+                if _opt_cls is not None and isinstance(block, _opt_cls):
+                    continue  # already compiled; cache was reset by remove_loras()
+                blk_list[i] = torch.compile(blk_list[i], fullgraph=False)
 
     # ------------------------------------------------------------------
     def load_model(self, cfg: dict, on_status) -> None:
@@ -263,19 +286,25 @@ class ChromaBackend(BaseSamplerBackend):
 
         fraction = max(0.0, min(0.99, offload_fraction / 100.0)) if offload_enabled else 0.0
         if fraction > 0:
-            # Offload + optional compile: let OT's checkpointing system handle
-            # per-block compile with fullgraph=True.  When use_compile=True,
-            # create_checkpoint() calls orig_module.compile(fullgraph=True) on
-            # each inner block and leaves the OffloadCheckpointLayer wrapper
-            # uncompiled (offloading logic cannot be in a compiled graph).
-            if use_compile:
-                on_status(f"Setting up layer offload ({fraction:.0%}) + compiling blocks …")
-            else:
-                on_status(f"Setting up layer offload ({fraction:.0%}) …")
+            # Offload enabled: set up conductor for layer offloading mechanics.
+            # Do NOT pass use_compile=True — that causes create_checkpoint() to
+            # synchronously compile all blocks during model load (5+ minute warmup).
+            # Instead, let _ensure_blocks_compiled() handle deferred compilation
+            # of inner blocks after LoRA injection (same as no-offload path).
+            on_status(f"Setting up layer offload ({fraction:.0%}) …")
             oc = _OffloadConfig(self.train_device, self.temp_device, fraction,
-                                use_compile=use_compile)
+                                use_compile=False)  # ← Don't compile during checkpoint creation!
             model.transformer_offload_conductor = \
                 enable_checkpointing_for_chroma_transformer(model.transformer, oc)
+            # Count blocks being checkpointed
+            double_blocks = len([b for b in model.transformer.transformer_blocks 
+                                if hasattr(b, 'checkpoint')])
+            single_blocks = len([b for b in model.transformer.single_transformer_blocks 
+                                if hasattr(b, 'checkpoint')])
+            on_status(f"[OFFLOAD-SETUP] {double_blocks} double blocks + {single_blocks} single blocks checkpointed")
+            # Mark for deferred compilation (same flag as no-offload path)
+            if use_compile:
+                self._compile_deferred = True
         elif use_compile:
             # No offload: defer compilation to sample() so it happens AFTER
             # LoRA injection.  Compiling here (before LoRA) causes per-step
@@ -317,6 +346,16 @@ class ChromaBackend(BaseSamplerBackend):
         state_dict = expand_diffusion_model_fused(state_dict)
         translator = make_chroma_translator(self.model.transformer, self.model.text_encoder)
         on_log = getattr(self, "_on_log", None)
+        
+        # Architecture comparison log
+        if on_log:
+            on_log("─── LoRA Architecture Comparison ───")
+            on_log("[OneTrainer] Uses LoRAModule class with .hook_to_module()")
+            on_log("[OneTrainer] Creates persistent LoRA layers during model setup")
+            on_log("[Sampler]    Uses apply_lora_hooks() with temporary injections")
+            on_log("[Sampler]    Three paths: weight-merge, GGUF compile-friendly, forward-patch")
+            on_log("─────────────────────────────────────")
+        
         return apply_lora_hooks(
             self.model.transformer,
             self.model.text_encoder,
@@ -325,7 +364,8 @@ class ChromaBackend(BaseSamplerBackend):
             translator,
             on_log=on_log,
             hint_device=self.train_device,
-            compile_friendly=getattr(self, '_compile_deferred', False),
+            compile_friendly=(getattr(self, '_compile_deferred', False)
+                              and getattr(self.model, 'transformer_offload_conductor', None) is None),
         )
 
     # ------------------------------------------------------------------
@@ -448,11 +488,6 @@ class ChromaBackend(BaseSamplerBackend):
             # --------------------------------------------------------------
 
             # ---- deferred compile (no-offload path) ----------------------
-            # Wrap blocks in torch.compile AFTER LoRA injection so dynamo's
-            # initial trace includes the patched forwards and guards are
-            # stable between diffusion steps.  Actual Triton compilation is
-            # lazy — triggered on step 1 of the denoising loop (~3-4 min
-            # cold, instant on same-session repeats).
             self._ensure_blocks_compiled()
             # --------------------------------------------------------------
 
