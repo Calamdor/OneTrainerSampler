@@ -406,7 +406,10 @@ def apply_lora_hooks(
         u = lora["up"].float().cpu()    # [out_dim, rank]
 
         # Dimension guard: skip if the LoRA output dim doesn't match the module.
-        mod_out_dim = getattr(getattr(module, "weight", None), "shape", (None,))[0]
+        # Prefer out_features (logical dim) over weight.shape[0] (may be GGUF packed).
+        mod_out_dim = getattr(module, "out_features", None)
+        if mod_out_dim is None:
+            mod_out_dim = getattr(getattr(module, "weight", None), "shape", (None,))[0]
         if mod_out_dim is not None and u.shape[0] != mod_out_dim:
             if on_log:
                 on_log(f"[LoRA-DIM-FAIL] {target}:{mod_path} — LoRA up dim={u.shape[0]}, "

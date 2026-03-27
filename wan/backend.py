@@ -74,59 +74,48 @@ class WanBackend(BaseSamplerBackend):
     def _ensure_blocks_compiled(self):
         """Compile transformer blocks if deferred compilation was requested.
 
-        Must be called AFTER LoRA injection so dynamo's initial trace
-        includes the patched forwards and its guards are stable between
-        diffusion steps.  Blocks already wrapped in OptimizedModule (from
-        a previous sample) are left as-is — torch._dynamo.reset() in
-        remove_loras() cleared stale caches, so the next call triggers a
-        clean retrace that captures the current forward methods.
+        Called AFTER LoRA injection so dynamo's initial trace includes the
+        patched forwards.  Uses module.compile() (in-place) rather than
+        torch.compile() (OptimizedModule wrapper) so the block type is
+        preserved — critical for the offload path where _kwargs_to_args
+        introspects the block's forward signature.
 
-        Compilation uses static shapes (the default) rather than dynamic=True.
-        Static shapes specialize on exact dimensions → ~2x faster compilation
-        and ~5% faster per-step runtime.  If the resolution changes between
-        samples, dynamo auto-recompiles once.
-
-        With the GGUF compile-friendly LoRA path (compile_friendly=True in
-        apply_lora_hooks), LoRA factors are stored as module attributes — not
-        closure variables — so persistent disk cache should work across
-        sessions.  The dequant call is one graph break per linear; LoRA merge
-        and F.linear are fused in the compiled graph.
+        fullgraph selection:
+          - GGUF: fullgraph=False — dequant is a torch.compiler.disable
+            graph break, incompatible with fullgraph=True.
+          - Everything else (NF4, INT8, FP8, W8A8*, BF16, FP16, FP32):
+            fullgraph=True — matches OneTrainer; traces INTO custom
+            autograd Functions so dynamo sees only standard torch ops.
         """
         if not getattr(self, '_compile_deferred', False):
             return
         if self.model is None:
             return
 
-        _opt_cls = getattr(torch._dynamo, "OptimizedModule", None)
+        cfg = self._loaded_cfg or {}
+        is_gguf = cfg.get("weight_dtype", "") in {"GGUF", "GGUF_A8I", "GGUF_A8F"}
+        fg = not is_gguf
+
         for xfmr in (self.model.transformer, self.model.transformer_2):
             for i in range(len(xfmr.blocks)):
                 block = xfmr.blocks[i]
 
-                # Check if this is an OffloadCheckpointLayer wrapper (offload path)
-                if hasattr(block, "checkpoint") and isinstance(block.checkpoint, torch.nn.Module):
-                    # Offload path: compile the INNER checkpoint module, not the wrapper.
-                    # The wrapper handles device transfers — cannot be compiled.
-                    inner_block = block.checkpoint
-                    if _opt_cls is not None and isinstance(inner_block, _opt_cls):
-                        continue  # already wrapped; cache was reset by remove_loras()
-
-                    # OneTrainer's create_checkpoint() calls orig_module.compile() but discards
-                    # the return value! So inner_block is still uncompiled. We need to replace
-                    # it with the compiled version.
-                    #
-                    # Do NOT compile the inner block when offload is active — see chroma/backend.py
-                    # for the full explanation. _kwargs_to_args breaks when self.checkpoint is a
-                    # compiled OptimizedModule (signature becomes *args/**kwargs, drops all args).
+                # Offload path: compile the INNER block, not the wrapper.
+                if hasattr(block, 'checkpoint') and \
+                        isinstance(block.checkpoint, torch.nn.Module):
+                    if hasattr(block.checkpoint, '_compiled_call_impl'):
+                        continue  # already compiled; cache was reset by remove_loras()
+                    block.checkpoint.compile(fullgraph=fg)
                     continue
 
-                # No-offload path: direct compile (existing behavior)
-                if _opt_cls is not None and isinstance(block, _opt_cls):
-                    continue  # already wrapped; cache was reset by remove_loras()
-                xfmr.blocks[i] = torch.compile(block, fullgraph=False)
+                # No-offload path: compile the block directly (in-place).
+                if hasattr(block, '_compiled_call_impl'):
+                    continue
+                block.compile(fullgraph=fg)
 
     # ------------------------------------------------------------------
     def load_model(self, cfg: dict, on_status) -> None:
-        self._compile_deferred = False  # reset; set below if use_compile + no offload
+        self._compile_deferred = False  # reset; set below if use_compile
         if self.model is not None:
             self.unload_model(on_status)
 
@@ -159,20 +148,6 @@ class WanBackend(BaseSamplerBackend):
             on_status(
                 f"GGUF T1: {os.path.basename(transformer_1_gguf)}  [{t1_summary}]\n"
                 f"GGUF T2: {os.path.basename(transformer_2_gguf)}  [{t2_summary}]"
-            )
-
-        _PURE_QUANTIZED = {"NF4", "INT8", "FP8", "W8A8F", "W8A8I"}
-        if use_compile and weight_dtype_str in _PURE_QUANTIZED and not svd_enabled:
-            on_status(
-                f"⚠ compile enabled but weight dtype is {weight_dtype_str} (quantized) — "
-                "torch.compile cannot optimize custom quantized kernels and will provide "
-                "no speedup. Disable compile to skip the warmup overhead."
-            )
-        elif use_compile and weight_dtype_str in _PURE_QUANTIZED and svd_enabled:
-            on_status(
-                f"⚠ compile + SVDQuant ({weight_dtype_str}): the SVD correction path "
-                "(functional.linear) will be compiled, but the quantized residual uses "
-                "custom kernels — partial speedup only."
             )
 
         if use_compile:
@@ -283,20 +258,27 @@ class WanBackend(BaseSamplerBackend):
 
         fraction = max(0.0, min(0.99, offload_fraction / 100.0)) if offload_enabled else 0.0
         if fraction > 0:
-            # Offload enabled: set up conductor for layer offloading mechanics.
-            # Do NOT pass use_compile=True — that causes create_checkpoint() to
-            # synchronously compile all blocks during model load (5+ minute warmup).
-            # Instead, let _ensure_blocks_compiled() handle deferred compilation
-            # of inner blocks after LoRA injection (same as no-offload path).
+            # Offload enabled: pass use_compile so OT's create_checkpoint()
+            # returns proper OffloadCheckpointLayer wrappers with .checkpoint
+            # pointing to the inner block.  OT also calls
+            # orig_module.compile(fullgraph=True) which we strip immediately
+            # below — we recompile after LoRA with the correct fullgraph
+            # setting for the weight type.
             on_status(f"Setting up layer offload ({fraction:.0%}) …")
             oc = _OffloadConfig(self.train_device, self.temp_device, fraction,
-                                use_compile=False)  # ← Don't compile during checkpoint creation!
+                                use_compile=use_compile)
             model.transformer_offload_conductor = \
                 enable_checkpointing_for_wan_transformer(model.transformer, oc)
             model.transformer_2_offload_conductor = \
                 enable_checkpointing_for_wan_transformer(model.transformer_2, oc)
-            # Mark for deferred compilation (same flag as no-offload path)
             if use_compile:
+                # Strip OT's premature fullgraph=True compile so we can
+                # recompile after LoRA injection with the right settings.
+                for xfmr in (model.transformer, model.transformer_2):
+                    for blk in xfmr.blocks:
+                        if hasattr(blk, 'checkpoint') and \
+                                hasattr(blk.checkpoint, '_compiled_call_impl'):
+                            del blk.checkpoint._compiled_call_impl
                 self._compile_deferred = True
         elif use_compile:
             # No offload: defer compilation to sample() so it happens AFTER
@@ -433,7 +415,6 @@ class WanBackend(BaseSamplerBackend):
             else:
                 on_progress(step, total)
 
-        _compile_restores = []  # (obj, saved) — restored in finally; see below
         try:
             _enum_name = ATTN_BACKEND_ENUM_NAME.get(attn_str)
             from diffusers.models.attention_dispatch import (
@@ -460,28 +441,11 @@ class WanBackend(BaseSamplerBackend):
             # Euler: keep existing scheduler (no shift override for Wan)
             # --------------------------------------------------------------
 
-            # ---- LoRA + compile guard (offload only) ---------------------
-            # When offload + compile is active OT wraps each block with
-            # orig_module.compile(fullgraph=True).  fullgraph silently bypasses
-            # forward hooks (LoRA).  Swap those inner compiled blocks to their
-            # _orig_mod so hooks fire in eager; restore after sampling.
-            _opt_cls = getattr(torch._dynamo, "OptimizedModule", None)
-            if self.lora_hooks and _opt_cls is not None:
-                for xfmr in (self.model.transformer, self.model.transformer_2):
-                    for blk in xfmr.blocks:
-                        if hasattr(blk, "checkpoint") and isinstance(blk.checkpoint, _opt_cls):
-                            _compiled_blocks.append((blk, blk.checkpoint))
-                            blk.checkpoint = blk.checkpoint._orig_mod
-                if _compiled_blocks:
-                    print(f"[compile] LoRAs + offload — {len(_compiled_blocks)} inner blocks "
-                          "in eager mode (fullgraph bypass)")
-            # --------------------------------------------------------------
-
-            # ---- deferred compile (no-offload path) ----------------------
-            # Wrap blocks in torch.compile AFTER LoRA injection so dynamo's
-            # initial trace includes the patched forwards and guards are
-            # stable between diffusion steps.  Actual Triton compilation is
-            # lazy — triggered on step 1 of the denoising loop.
+            # ---- deferred compile ----------------------------------------
+            # Compile inner blocks AFTER LoRA injection so dynamo's trace
+            # captures the patched forwards.  With compile-after-LoRA and
+            # method-patching (not hooks), the compiled graph includes LoRA
+            # — no need to swap to eager.
             self._ensure_blocks_compiled()
             # --------------------------------------------------------------
 
@@ -593,8 +557,6 @@ class WanBackend(BaseSamplerBackend):
             finally:
                 _ws_mod.tqdm = _orig_ws_tqdm
                 self.model.noise_scheduler = _orig_scheduler
-                for _blk, _compiled_inner in _compiled_blocks:
-                    _blk.checkpoint = _compiled_inner
                 if _et_patched:
                     self.model.encode_text = _et_orig
                 if _te_to_orig is not None:
