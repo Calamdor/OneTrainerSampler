@@ -35,6 +35,8 @@ remove_loras() works identically for all.
 import torch
 import torch.nn.functional as F
 
+_GGUF_FP8_MAX = 448.0  # torch.finfo(torch.float8_e4m3fn).max
+
 
 # ---------------------------------------------------------------------------
 # Weight-merge path (float layers — zero per-step cost)
@@ -107,8 +109,8 @@ def _gguf_dequant_weight(weight):
 _gguf_dequant_weight = torch.compiler.disable(_gguf_dequant_weight)
 
 
-def _gguf_compile_forward(self, x):
-    """Compile-friendly forward for GGUF modules with LoRA.
+def _gguf_compile_forward_int8(self, x):
+    """Compile-friendly forward for GGUF_A8I modules (int8 activation requant).
 
     Bound to modules as an unbound function via types.MethodType so it
     appears as a regular method — no closure variables for dynamo to guard on.
@@ -158,13 +160,76 @@ def _gguf_compile_forward(self, x):
     return y.reshape(x.shape[:-1] + (y.shape[-1],))
 
 
+def _gguf_compile_forward_fp8(self, x):
+    """Compile-friendly forward for GGUF_A8F modules (fp8 activation requant).
+
+    Bound to modules as an unbound function via types.MethodType so it
+    appears as a regular method — no closure variables for dynamo to guard on.
+
+    Flow:
+      1. Dequantize GGUF weight → float (graph break — one per linear)
+      2. Merge all LoRA factors onto dequantized weight (compiled, pure torch)
+      3. FP8 axiswise quantize input + merged weight, torch._scaled_mm, rescale
+
+    Matches LinearGGUFFpA8RequantFunction.forward logic exactly. Falls back to
+    F.linear for small batches (<=16 rows) — same as LinearGGUFA8.forward.
+
+    Requires a CUDA GPU with SM >= 89 (Ada Lovelace / RTX 40xx or newer)
+    for native fp8 matmul support.
+    """
+    try:
+        w = _gguf_dequant_weight(self.weight)           # graph break
+        dt = self._gguf_compile_dt
+        w = w.to(device=self._gguf_compile_dev, dtype=dt)
+
+        # Compiled: merge LoRA factors
+        for i, (dv, uv, s) in enumerate(self._lora_factors):
+            w = w + (uv @ dv) * s
+
+        bias = self.bias
+        if bias is not None:
+            bias = bias.to(dtype=dt)
+
+        x_2d = x.reshape(-1, x.shape[-1])
+
+        # Small-batch fallback: skip fp8 quantization (matches LinearGGUFA8.forward)
+        if x_2d.shape[0] <= 16:
+            y = torch.nn.functional.linear(x_2d, w, bias)
+            return y.reshape(x.shape[:-1] + (y.shape[-1],))
+
+        # FP8 axiswise quantization of input
+        x_scale = x_2d.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / _GGUF_FP8_MAX
+        x_fp8 = (x_2d / x_scale).clamp(-_GGUF_FP8_MAX, _GGUF_FP8_MAX).to(torch.float8_e4m3fn)
+
+        # FP8 axiswise quantization of merged weight
+        w_scale = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / _GGUF_FP8_MAX
+        w_fp8 = (w / w_scale).clamp(-_GGUF_FP8_MAX, _GGUF_FP8_MAX).to(torch.float8_e4m3fn)
+
+        # Scaled fp8 matmul → float32, then rescale to compute dtype
+        one = torch.ones(1, device=self._gguf_compile_dev, dtype=torch.float32)
+        y = torch._scaled_mm(x_fp8, w_fp8.t(), scale_a=one, scale_b=one, out_dtype=torch.float32)
+        y = y.mul(w_scale.t()).mul(x_scale).to(dtype=dt)
+
+        if bias is not None:
+            y = y.add_(bias)
+
+        return y.reshape(x.shape[:-1] + (y.shape[-1],))
+    except Exception as _e:
+        lf = [(dv.shape, uv.shape) for dv, uv, _ in self._lora_factors]
+        raise RuntimeError(
+            f"_gguf_compile_forward_fp8 failed: weight_byte_shape={self.weight.shape} "
+            f"x_in={x.shape} lora_factors={lf}: {_e}"
+        ) from _e
+
+
 class _GGUFCompilePatch:
     """Compile-friendly LoRA patch for GGUF modules.
 
-    Replaces forward with dequant → merge → int8 matmul.  LoRA factors stored
-    as module attributes (_lora_factors) — NOT closure variables — so
-    torch.compile guards are based on stable module structure, and persistent
-    disk cache works across app restarts.
+    Replaces forward with dequant → merge → int8 or fp8 matmul depending on
+    the module's _dtype attribute.  LoRA factors stored as module attributes
+    (_lora_factors) — NOT closure variables — so torch.compile guards are
+    based on stable module structure, and persistent disk cache works across
+    app restarts.
 
     One handle is created per module (first LoRA).  Subsequent LoRAs on the
     same module get a lightweight _GGUFFactorRef handle.  remove() on the
@@ -178,7 +243,8 @@ class _GGUFCompilePatch:
 
     def remove(self) -> None:
         self._module.forward = self._orig_forward
-        for attr in ('_lora_factors', '_gguf_compile_dt', '_gguf_compile_dev'):
+        for attr in ('_lora_factors', '_gguf_compile_dt', '_gguf_compile_dev',
+                     '_gguf_compile_is_fp8'):
             try:
                 delattr(self._module, attr)
             except AttributeError:
@@ -364,12 +430,16 @@ def apply_lora_hooks(
             dt = getattr(module, "compute_dtype", None) or torch.bfloat16
 
             if not hasattr(module, '_lora_factors'):
-                # First LoRA on this module: set up compile-friendly forward
+                # First LoRA on this module: set up compile-friendly forward.
+                # Dispatch to fp8 or int8 variant based on module._dtype.
                 orig_fwd = module.forward
                 module._lora_factors = []
                 module._gguf_compile_dt = dt
                 module._gguf_compile_dev = dev
-                module.forward = types.MethodType(_gguf_compile_forward, module)
+                is_fp8 = getattr(module, '_dtype', None) == torch.float8_e4m3fn
+                module._gguf_compile_is_fp8 = is_fp8
+                forward_fn = _gguf_compile_forward_fp8 if is_fp8 else _gguf_compile_forward_int8
+                module.forward = types.MethodType(forward_fn, module)
                 handles.append(_GGUFCompilePatch(module, orig_fwd))
             else:
                 # Additional LoRA on same module: lightweight ref handle

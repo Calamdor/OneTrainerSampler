@@ -91,41 +91,25 @@ class ChromaBackend(BaseSamplerBackend):
         and F.linear are fused in the compiled graph.  Expected cold compile:
         ~30-90 seconds (vs ~4 min with the old closure-based forward patches).
 
-        Offload path: inner checkpoint blocks are NOT compiled here. The offload
-        conductor uses _kwargs_to_args(self.checkpoint.forward) to convert
-        keyword args to positional before calling each block. A compiled
-        OptimizedModule's .forward has signature (*args, **kwargs), so
-        inspect.signature sees no named parameters — _kwargs_to_args silently
-        drops all arguments and the block receives an empty tuple, producing
-        shape errors at runtime. Keeping inner blocks uncompiled preserves their
-        named signatures so argument ordering works correctly.
+        Offload + compile: outer blocks are compiled with fullgraph=False.
+        OffloadCheckpointLayer.forward is the patched .forward on each block.
+        Conductor operations (before_layer / after_layer) are Python side-effects
+        that dynamo cannot trace — they become graph breaks automatically.
+        Between graph breaks the inner block's math (LoRA merge + fp8/int8 matmul)
+        is compiled, giving partial compute speedup.
+
+        The _kwargs_to_args crash cited in earlier comments only applies to OT's
+        compile=True checkpoint path, where self.checkpoint is a compiled
+        OptimizedModule with signature (*args, **kwargs). We use compile=False
+        so self.checkpoint is None and self.orig_forward (with named params) is
+        used instead — no silent arg-dropping, no crash.
         """
         if not getattr(self, '_compile_deferred', False):
             return
         if self.model is None:
             return
 
-        # Offload path: skip all block-level compilation.
-        #
-        # When OT's create_checkpoint() runs with compile=False it patches
-        # block.forward = OffloadCheckpointLayer.forward in-place and returns
-        # the original block unchanged (not a new wrapper).  The block stays as
-        # ChromaTransformerBlock in the module list with no structural marker
-        # to distinguish it from a plain non-offload block.
-        #
-        # Compiling a forward-patched offload block causes two failure modes:
-        #   1. _kwargs_to_args inspects the compiled .forward signature
-        #      (*args, **kwargs) and silently drops all named args → block
-        #      receives empty inputs → shape errors ("1536 must match 3072").
-        #   2. Dynamo traces through OffloadCheckpointLayer.forward + GGUF
-        #      __torch_function__ with fake tensors → symbolic numel() error.
-        #
-        # When offload is active the bottleneck is VRAM transfer bandwidth, not
-        # compute, so block-level compile provides negligible benefit anyway.
-        if getattr(self.model, 'transformer_offload_conductor', None) is not None:
-            return
-
-        # No-offload path: compile each block lazily.
+        # Compile each block lazily (both offload and no-offload paths).
         _opt_cls = getattr(torch._dynamo, "OptimizedModule", None)
         for blk_list in (self.model.transformer.transformer_blocks,
                          self.model.transformer.single_transformer_blocks):
@@ -353,9 +337,11 @@ class ChromaBackend(BaseSamplerBackend):
             on_log("[OneTrainer] Uses LoRAModule class with .hook_to_module()")
             on_log("[OneTrainer] Creates persistent LoRA layers during model setup")
             on_log("[Sampler]    Uses apply_lora_hooks() with temporary injections")
-            on_log("[Sampler]    Three paths: weight-merge, GGUF compile-friendly, forward-patch")
+            on_log("[Sampler]    Four paths: weight-merge, GGUF compile-friendly fp8, GGUF compile-friendly int8, forward-patch")
             on_log("─────────────────────────────────────")
-        
+
+        compile_friendly = getattr(self, '_compile_deferred', False)
+            
         return apply_lora_hooks(
             self.model.transformer,
             self.model.text_encoder,
@@ -364,8 +350,7 @@ class ChromaBackend(BaseSamplerBackend):
             translator,
             on_log=on_log,
             hint_device=self.train_device,
-            compile_friendly=(getattr(self, '_compile_deferred', False)
-                              and getattr(self.model, 'transformer_offload_conductor', None) is None),
+            compile_friendly=compile_friendly,
         )
 
     # ------------------------------------------------------------------
@@ -640,4 +625,6 @@ class ChromaBackend(BaseSamplerBackend):
         except Cancelled:
             on_done(None, None)
         except Exception as exc:
-            on_error(str(exc))
+            import traceback as _tb
+            full = _tb.format_exc()
+            on_error(str(exc) + "\n\n" + full)
