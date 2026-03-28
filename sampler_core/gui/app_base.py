@@ -39,10 +39,23 @@ except ImportError:
 def _load_video_frames(path: str) -> tuple[list, float]:
     """
     Decode all frames of an MP4 as PIL Images.  Returns (frames, fps).
-    Tries imageio (ffmpeg plugin) first; falls back to cv2.
+    Tries PyAV first, then imageio (ffmpeg plugin), then cv2.
     Called from a background thread — no tkinter calls inside.
     """
     from PIL import Image
+
+    # ---- PyAV -----------------------------------------------------------
+    try:
+        import av
+        container = av.open(path)
+        stream    = container.streams.video[0]
+        fps       = float(stream.average_rate) if stream.average_rate else 24.0
+        frames    = [f.to_image() for f in container.decode(video=0)]
+        container.close()
+        if frames:
+            return frames, fps
+    except Exception:
+        pass
 
     # ---- imageio / ffmpeg -----------------------------------------------
     try:

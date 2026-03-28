@@ -35,8 +35,19 @@ def write_png_metadata(path: str, tool_key: str, params: dict) -> None:
 def _read_first_frame(video_path: str):
     """
     Return the first frame of a video file as a PIL Image, or None on failure.
-    Tries imageio (ffmpeg plugin) first, then cv2.
+    Tries PyAV first, then imageio (ffmpeg plugin), then cv2.
     """
+    try:
+        import av
+        container = av.open(video_path)
+        for frame in container.decode(video=0):
+            img = frame.to_image()
+            container.close()
+            return img
+        container.close()
+    except Exception:
+        pass
+
     try:
         import imageio
         reader = imageio.get_reader(video_path, format="ffmpeg")
