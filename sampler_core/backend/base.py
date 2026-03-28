@@ -172,10 +172,11 @@ class BaseSamplerBackend(ABC):
             return
 
         self.remove_loras()
-        total_hooks = 0
-        applied = 0
-        skipped = 0
 
+        # ---- Phase 1: load all LoRA state dicts from disk ----------------
+        from safetensors.torch import load_file
+        loaded = []   # [(name, state_dict, weight, entry), ...]
+        skipped = 0
         for entry in loras:
             name = os.path.basename(entry.get("path", ""))
             if not entry.get("enabled", True):
@@ -187,17 +188,23 @@ class BaseSamplerBackend(ABC):
                 skipped += 1
                 continue
             try:
-                _status(f"[LoRA] Loading {name} …")
-                from safetensors.torch import load_file
                 state_dict = load_file(path)
             except Exception as exc:
                 _status(f"[LoRA] ERROR loading {name}: {exc}")
                 skipped += 1
                 continue
+            loaded.append((name, state_dict, float(entry.get("weight", 1.0)), entry))
 
-            weight = float(entry.get("weight", 1.0))
+        if loaded:
+            names = ", ".join(n for n, *_ in loaded)
+            _status(f"[LoRA] Loaded {len(loaded)} LoRA(s): {names}")
+
+        # ---- Phase 2: inject all into model ------------------------------
+        total_hooks = 0
+        applied = 0
+        self._on_log = _status
+        for name, state_dict, weight, entry in loaded:
             try:
-                self._on_log = _status   # let _inject_lora implementations pick this up
                 hooks = self._inject_lora(state_dict, weight, entry)
             except Exception as exc:
                 import traceback as _tb
@@ -208,10 +215,6 @@ class BaseSamplerBackend(ABC):
             self.lora_hooks.extend(hooks)
             total_hooks += len(hooks)
             applied += 1
-            if len(hooks) == 0:
-                _status(f"[LoRA] {name} — 0 handles returned (key format mismatch?)")
-            else:
-                _status(f"[LoRA] Applied {name}  weight={weight}  handles={len(hooks)}")
 
         _status(
             f"LoRAs done — {applied} applied, {skipped} skipped"
