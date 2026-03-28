@@ -36,7 +36,7 @@ _DEFAULT_NEGATIVE = (
 DEFAULTS = {
     "base_model":       "lodestones/Chroma1-HD",
     "transformer_gguf": "",
-    "weight_dtype":     "NF4",
+    "weight_dtype":     "BF16",
     "text_enc_dtype":   "BF16",
     "svd_enabled":      False,
     "svd_rank":         16,

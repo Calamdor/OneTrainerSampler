@@ -115,7 +115,7 @@ class ChromaBackend(BaseSamplerBackend):
         if self.model is not None:
             self.unload_model(on_status)
 
-        weight_dtype_str      = cfg.get("weight_dtype", "NF4")
+        weight_dtype_str      = cfg.get("weight_dtype", "BF16")
         te_dtype_str          = cfg.get("text_enc_dtype", "BF16")
         svd_enabled           = cfg.get("svd_enabled", False)
         svd_rank              = int(cfg.get("svd_rank", 16))
@@ -159,7 +159,7 @@ class ChromaBackend(BaseSamplerBackend):
                 pass  # older PyTorch — inductor config not available
             # --------------------------------------------------------------
 
-        weight_dtype  = DTYPE_MAP.get(weight_dtype_str, DataType.NFLOAT_4)
+        weight_dtype  = DTYPE_MAP.get(weight_dtype_str, DataType.BFLOAT_16)
         te_dtype      = DTYPE_MAP.get(te_dtype_str, DataType.BFLOAT_16)
         compute_dtype = COMPUTE_DATATYPE.get(weight_dtype_str, DataType.BFLOAT_16)
         torch_compute = COMPUTE_TORCH_DTYPE.get(weight_dtype_str, torch.bfloat16)

@@ -31,7 +31,7 @@ DEFAULTS = {
     "base_model_path":    "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
     "transformer_1_gguf": "",
     "transformer_2_gguf": "",
-    "weight_dtype":       "NF4",
+    "weight_dtype":       "BF16",
     "text_enc_dtype":     "BF16",
     "svd_enabled":        False,
     "svd_rank":           16,
