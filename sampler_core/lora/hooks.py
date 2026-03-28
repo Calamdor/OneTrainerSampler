@@ -130,7 +130,7 @@ def _gguf_compile_forward_int8(self, x):
     # Factors live on CPU; moved to compute device on demand (ComfyUI-style).
     if self._lora_d is not None:
         dev = w.device
-        w = w + self._lora_u.to(dev) @ self._lora_d.to(dev)
+        w = w + self._lora_u.to(dev, non_blocking=True) @ self._lora_d.to(dev, non_blocking=True)
 
     # Compiled: int8 quantized matmul (same as original A8I path)
     # All ops are standard torch — _int_mm is a built-in ATen op.
@@ -184,7 +184,7 @@ def _gguf_compile_forward_fp8(self, x):
         # Compiled: merge pre-concatenated LoRA delta onto dequantized weight.
         if self._lora_d is not None:
             dev = w.device
-            w = w + self._lora_u.to(dev) @ self._lora_d.to(dev)
+            w = w + self._lora_u.to(dev, non_blocking=True) @ self._lora_d.to(dev, non_blocking=True)
 
         bias = self.bias
         if bias is not None:
@@ -284,7 +284,8 @@ def _quantized_compile_forward(self, x):
     y = self._orig_forward_for_lora(x)
     if self._lora_d is not None:
         dev = x.device
-        y = y + F.linear(F.linear(x, self._lora_d.to(dev)), self._lora_u.to(dev))
+        y = y + F.linear(F.linear(x, self._lora_d.to(dev, non_blocking=True)),
+                         self._lora_u.to(dev, non_blocking=True))
     return y
 
 
@@ -297,9 +298,10 @@ def _rebuild_merged_lora(module: torch.nn.Module) -> None:
 
     Then U_merged @ D_merged = sum(u_i @ d_i * s_i) in one matmul.
 
-    Merged tensors are stored on CPU (ComfyUI-style).  The forward
-    functions move them to the compute device on demand so only the
-    active layer's LoRA factors consume VRAM at any given time.
+    Merged tensors are stored on CPU in pinned memory (ComfyUI-style).
+    The forward functions move them to the compute device on demand
+    with non_blocking=True so only the active layer's LoRA factors
+    consume VRAM, and the transfer overlaps with GPU computation.
     """
     factors = getattr(module, '_lora_factors', [])
     if not factors:
@@ -308,8 +310,16 @@ def _rebuild_merged_lora(module: torch.nn.Module) -> None:
         return
     ds = [dv for dv, _, _ in factors]
     us = [uv * s for _, uv, s in factors]
-    module._lora_d = torch.cat(ds, dim=0).cpu()   # [sum(ranks), in_dim]
-    module._lora_u = torch.cat(us, dim=1).cpu()   # [out_dim, sum(ranks)]
+    d_merged = torch.cat(ds, dim=0).cpu()
+    u_merged = torch.cat(us, dim=1).cpu()
+    # Pinned memory enables fast DMA transfers (~2x vs unpinned).
+    try:
+        module._lora_d = d_merged.pin_memory()
+        module._lora_u = u_merged.pin_memory()
+    except RuntimeError:
+        # pin_memory can fail if CUDA isn't available or limit exceeded
+        module._lora_d = d_merged
+        module._lora_u = u_merged
 
 
 class _QuantizedCompilePatch:
