@@ -50,7 +50,7 @@ COMPUTE_DTYPE_OVERRIDE = {
 }
 
 TRANSFORMER_DTYPE_OPTIONS = ["NF4", "FP8", "W8A8F", "W8A8I", "BF16", "FP16", "FP32", "GGUF", "GGUF_A8I", "GGUF_A8F"]
-TEXT_ENC_DTYPE_OPTIONS    = ["BF16", "FP16", "FP32", "NF4"]
+TEXT_ENC_DTYPE_OPTIONS    = ["BF16", "FP16", "FP32", "NF4", "FP8"]
 
 # SVD residual dtype — BF16/FP32 only (OT UI excludes FP16 for Chroma).
 # Models that allow FP16 (e.g. Wan) define their own _SVD_DTYPE_OPTIONS locally.
