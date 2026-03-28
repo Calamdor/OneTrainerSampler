@@ -262,7 +262,7 @@ class ChromaBackend(BaseSamplerBackend):
                                  model.transformer.single_transformer_blocks):
                     for blk in blk_list:
                         if hasattr(blk, 'checkpoint') and \
-                                hasattr(blk.checkpoint, '_compiled_call_impl'):
+                                blk.checkpoint._compiled_call_impl is not None:
                             del blk.checkpoint._compiled_call_impl
                 self._compile_deferred = True
         elif use_compile:

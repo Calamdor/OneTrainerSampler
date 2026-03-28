@@ -272,7 +272,7 @@ class WanBackend(BaseSamplerBackend):
                 for xfmr in (model.transformer, model.transformer_2):
                     for blk in xfmr.blocks:
                         if hasattr(blk, 'checkpoint') and \
-                                hasattr(blk.checkpoint, '_compiled_call_impl'):
+                                blk.checkpoint._compiled_call_impl is not None:
                             del blk.checkpoint._compiled_call_impl
                 self._compile_deferred = True
         elif use_compile:
@@ -312,11 +312,7 @@ class WanBackend(BaseSamplerBackend):
         else:
             dtype_label = weight_dtype_str
         offload_str  = f"offload {fraction:.0%}" if fraction > 0 else "offload off"
-        # compile_note reflects whether compilation is deferred (fast warmup)
-        # or done synchronously per-block (slow warmup). With the optimization,
-        # both no-offload and offload paths now defer when use_compile=True.
-        compile_note = ("  compile:deferred" if use_compile
-                        else "")
+        compile_note = "  compile:deferred" if use_compile else ""
         on_status(f"Loaded [{dtype_label}]  |  {offload_str}{compile_note}")
 
     # ------------------------------------------------------------------
