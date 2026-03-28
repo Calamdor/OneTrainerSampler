@@ -20,7 +20,7 @@ from sampler_core.util.ot_bridge import find_ot_quant_cache
 from sampler_core.util.png_meta import write_png_metadata, write_png_sidecar, write_mp4_metadata
 from sampler_core.util.tokenizer_patch import patch_tokenizer_no_truncate
 from sampler_core.util.resolution import ATTN_BACKEND_ENUM_NAME, check_attn_backends
-from sampler_core.lora.hooks import apply_lora_hooks, move_lora_factors_to_device
+from sampler_core.lora.hooks import apply_lora_hooks
 from wan.lora_keys import make_wan_translator, _detect_expert_from_filename
 
 from modules.model.WanModel import WanModel
@@ -440,25 +440,25 @@ class WanBackend(BaseSamplerBackend):
             self._ensure_blocks_compiled()
             # --------------------------------------------------------------
 
-            # ---- LoRA factor device management -----------------------------
-            # Patch transformer_1_to / transformer_2_to so LoRA factors move
-            # with the expert.  Only the active transformer's factors consume
-            # VRAM; the other's stay on CPU.
-            _lora_device_patch = False
+            # ---- LoRA factor offload integration ----------------------------
+            # Monkey-patch offload_quantized so LoRA factors (_lora_d/_lora_u)
+            # move WITH the weights.  The conductor calls offload_quantized
+            # per-module when moving blocks between CPU/GPU.  By extending it,
+            # factors follow the same device as weights — correct for ANY
+            # offload percentage (50% keeps half on GPU permanently, 99% cycles
+            # all but ~1 block).
+            _offload_patched = False
             if self.lora_hooks:
-                _orig_t1_to = self.model.transformer_1_to
-                _orig_t2_to = self.model.transformer_2_to
-                _xfmr1 = self.model.transformer
-                _xfmr2 = self.model.transformer_2
-                def _patched_t1_to(device):
-                    _orig_t1_to(device)
-                    move_lora_factors_to_device(_xfmr1, device)
-                def _patched_t2_to(device):
-                    _orig_t2_to(device)
-                    move_lora_factors_to_device(_xfmr2, device)
-                self.model.transformer_1_to = _patched_t1_to
-                self.model.transformer_2_to = _patched_t2_to
-                _lora_device_patch = True
+                from modules.util import quantization_util as _qu
+                _orig_offload_q = _qu.offload_quantized
+                def _patched_offload_q(module, device, non_blocking=False, allocator=None):
+                    _orig_offload_q(module, device, non_blocking, allocator)
+                    d = getattr(module, '_lora_d', None)
+                    if d is not None:
+                        module._lora_d = module._lora_d.to(device, non_blocking=non_blocking)
+                        module._lora_u = module._lora_u.to(device, non_blocking=non_blocking)
+                _qu.offload_quantized = _patched_offload_q
+                _offload_patched = True
             # --------------------------------------------------------------
 
             # ---- UMT5 embedding cache ------------------------------------
@@ -569,9 +569,8 @@ class WanBackend(BaseSamplerBackend):
             finally:
                 _ws_mod.tqdm = _orig_ws_tqdm
                 self.model.noise_scheduler = _orig_scheduler
-                if _lora_device_patch:
-                    self.model.transformer_1_to = _orig_t1_to
-                    self.model.transformer_2_to = _orig_t2_to
+                if _offload_patched:
+                    _qu.offload_quantized = _orig_offload_q
                 if _et_patched:
                     self.model.encode_text = _et_orig
                 if _te_to_orig is not None:

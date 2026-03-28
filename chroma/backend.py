@@ -422,9 +422,26 @@ class ChromaBackend(BaseSamplerBackend):
             self._ensure_blocks_compiled()
             # --------------------------------------------------------------
 
-            # Move LoRA factors to GPU for the single transformer.
+            # ---- LoRA factor offload integration ----------------------------
+            # Extend offload_quantized so LoRA factors move WITH weights.
+            # For no-offload: move all factors to GPU once before sampling.
+            # For offload: factors follow the conductor's per-block management.
+            _offload_patched = False
             if self.lora_hooks:
-                move_lora_factors_to_device(self.model.transformer, self.train_device)
+                from modules.util import quantization_util as _qu
+                _orig_offload_q = _qu.offload_quantized
+                def _patched_offload_q(module, device, non_blocking=False, allocator=None):
+                    _orig_offload_q(module, device, non_blocking, allocator)
+                    d = getattr(module, '_lora_d', None)
+                    if d is not None:
+                        module._lora_d = module._lora_d.to(device, non_blocking=non_blocking)
+                        module._lora_u = module._lora_u.to(device, non_blocking=non_blocking)
+                _qu.offload_quantized = _patched_offload_q
+                _offload_patched = True
+                if not getattr(self.model, 'transformer_offload_conductor', None):
+                    # No offload: move all factors to GPU once.
+                    move_lora_factors_to_device(self.model.transformer, self.train_device)
+            # --------------------------------------------------------------
 
             sampler = ChromaSampler(
                 self.train_device, self.temp_device,
@@ -525,6 +542,8 @@ class ChromaBackend(BaseSamplerBackend):
             finally:
                 _cs_mod.tqdm = _orig_cs_tqdm
                 self.model.noise_scheduler = _orig_scheduler
+                if _offload_patched:
+                    _qu.offload_quantized = _orig_offload_q
                 if _needs_mask_patch:
                     _transformer.forward = _orig_tr_fwd
                 if _et_patched:

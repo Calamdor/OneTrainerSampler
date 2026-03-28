@@ -69,6 +69,69 @@ class _WeightMerge:
             w.data.sub_(delta)
 
 
+class _QuantizedWeightMerge:
+    """
+    Undoable LoRA weight merge for quantized modules (W8A8I, W8A8F, FP8).
+
+    Dequantizes the weight, adds the LoRA delta, re-quantizes, and stores
+    back.  Zero per-step overhead, zero LoRA VRAM — the delta is baked
+    into the weight.  On remove(), the process is reversed.
+
+    Inspired by ComfyUI-WanVideoWrapper's apply_lora() which merges LoRA
+    into quantized weights as the default strategy.
+    """
+    __slots__ = ("_module", "_d", "_u", "_scale", "_device")
+
+    def __init__(self, module: torch.nn.Module,
+                 d: torch.Tensor, u: torch.Tensor, scale: float,
+                 device: torch.device):
+        self._module = module
+        self._d      = d
+        self._u      = u
+        self._scale  = scale
+        self._device = device  # GPU for quantization ops
+
+    def _apply_delta(self, sign: float) -> None:
+        module = self._module
+        w = module.weight.detach()
+        orig_device = w.device
+
+        # Dequantize to float on GPU
+        s = getattr(module, 'scale', None)
+        if s is not None:
+            w_float = w.to(device=self._device, dtype=torch.float32) * s.to(
+                device=self._device, dtype=torch.float32)
+        else:
+            w_float = w.to(device=self._device, dtype=torch.float32)
+
+        # Apply delta
+        delta = (sign * self._scale * (self._u @ self._d)).to(
+            device=self._device, dtype=torch.float32)
+        w_float.add_(delta)
+
+        # Re-quantize
+        _dtype = getattr(module, '_dtype', w.dtype)
+        if _dtype == torch.int8:
+            from modules.util.quantization_util import quantize_int8_tensorwise
+            w_q, new_scale = quantize_int8_tensorwise(w_float)
+        elif _dtype == torch.float8_e4m3fn:
+            from modules.util.quantization_util import quantize_fp8_tensorwise
+            w_q, new_scale = quantize_fp8_tensorwise(w_float)
+        else:
+            # FP8 (LinearFp8) — uses fp8_dtype and _scale
+            fp8_max = torch.finfo(torch.float8_e4m3fn).max
+            abs_max = w_float.abs().max()
+            new_scale = torch.clamp(abs_max, min=1e-12) / fp8_max
+            w_q = w_float.div_(new_scale).to(dtype=torch.float8_e4m3fn)
+
+        module.weight.data = w_q.to(device=orig_device)
+        if s is not None:
+            s.copy_(new_scale.to(device=s.device))
+
+    def remove(self) -> None:
+        self._apply_delta(-1.0)
+
+
 def _can_merge(module: torch.nn.Module) -> bool:
     """
     Return True if the module's weight can be modified in-place.
@@ -82,6 +145,17 @@ def _can_merge(module: torch.nn.Module) -> bool:
         and w.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and w.is_leaf
     )
+
+
+def _can_merge_quantized(module: torch.nn.Module) -> bool:
+    """Return True for quantized modules that support dequant→merge→requantize."""
+    if not hasattr(module, 'scale'):
+        return False
+    w = getattr(module, "weight", None)
+    if w is None:
+        return False
+    # W8A8I (int8), W8A8F (fp8), LinearFp8 (fp8)
+    return w.dtype in (torch.int8, torch.float8_e4m3fn)
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +535,7 @@ def apply_lora_hooks(
     handles = []
     fail_count = 0
     merge_count = 0
+    qmerge_count = 0
     hook_count = 0
     qcomp_count = 0
     gguf_count = 0
@@ -497,11 +572,21 @@ def apply_lora_hooks(
             continue
 
         if _can_merge(module):
-            # ---- Fast path: merge delta directly into weights ----------------
+            # ---- Fast path: merge delta directly into float weights -----------
             w = module.weight
             w.data.add_((scale * (u @ d)).to(device=w.device, dtype=w.dtype))
             handles.append(_WeightMerge(module, d, u, scale))
             merge_count += 1
+
+        elif _can_merge_quantized(module):
+            # ---- Quantized merge: dequant → add delta → requantize -----------
+            # Zero per-step overhead, zero LoRA VRAM.  Works for W8A8I,
+            # W8A8F, FP8 (any module with a scale buffer and int8/fp8 weight).
+            dev = hint_device or torch.device("cuda")
+            qm = _QuantizedWeightMerge(module, d, u, scale, dev)
+            qm._apply_delta(1.0)
+            handles.append(qm)
+            qmerge_count += 1
 
         elif compile_friendly and _is_gguf_module(module):
             # ---- GGUF compile-friendly path ----------------------------------
@@ -599,7 +684,7 @@ def apply_lora_hooks(
     # ---- Logging -------------------------------------------------------
     _log = on_log if on_log is not None else print
     total_parsed = len(loras)
-    ok_count = merge_count + hook_count + qcomp_count + gguf_count
+    ok_count = merge_count + qmerge_count + hook_count + qcomp_count + gguf_count
     if total_parsed == 0:
         _log("[LoRA] no LoRA entries parsed — check key format")
         for k in list(state_dict.keys())[:8]:
@@ -623,6 +708,8 @@ def apply_lora_hooks(
         parts = []
         if merge_count:
             parts.append(f"{merge_count} weight-merged")
+        if qmerge_count:
+            parts.append(f"{qmerge_count} quantized-merged")
         if gguf_count:
             parts.append(f"{gguf_count} gguf-compile")
         if qcomp_count:
