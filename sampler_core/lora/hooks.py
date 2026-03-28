@@ -126,10 +126,11 @@ def _gguf_compile_forward_int8(self, x):
     dt = self._gguf_compile_dt
     w = w.to(device=self._gguf_compile_dev, dtype=dt)
 
-    # Compiled: merge LoRA factors (stored as module attributes)
-    for dv, uv, s in self._lora_factors:
-        # uv @ dv: [out_dim, rank] @ [rank, in_dim] → [out_dim, in_dim]
-        w = w + (uv @ dv) * s
+    # Compiled: merge pre-concatenated LoRA delta onto dequantized weight.
+    # _lora_u @ _lora_d: [out_dim, sum(ranks)] @ [sum(ranks), in_dim]
+    # Single matmul regardless of how many LoRAs are stacked.
+    if self._lora_d is not None:
+        w = w + self._lora_u @ self._lora_d
 
     # Compiled: int8 quantized matmul (same as original A8I path)
     # All ops are standard torch — _int_mm is a built-in ATen op.
@@ -180,9 +181,9 @@ def _gguf_compile_forward_fp8(self, x):
         dt = self._gguf_compile_dt
         w = w.to(device=self._gguf_compile_dev, dtype=dt)
 
-        # Compiled: merge LoRA factors
-        for i, (dv, uv, s) in enumerate(self._lora_factors):
-            w = w + (uv @ dv) * s
+        # Compiled: merge pre-concatenated LoRA delta onto dequantized weight.
+        if self._lora_d is not None:
+            w = w + self._lora_u @ self._lora_d
 
         bias = self.bias
         if bias is not None:
@@ -213,10 +214,11 @@ def _gguf_compile_forward_fp8(self, x):
 
         return y.reshape(x.shape[:-1] + (y.shape[-1],))
     except Exception as _e:
-        lf = [(dv.shape, uv.shape) for dv, uv, _ in self._lora_factors]
+        d_shape = getattr(self._lora_d, 'shape', None)
+        u_shape = getattr(self._lora_u, 'shape', None)
         raise RuntimeError(
             f"_gguf_compile_forward_fp8 failed: weight_byte_shape={self.weight.shape} "
-            f"x_in={x.shape} lora_factors={lf}: {_e}"
+            f"x_in={x.shape} lora_d={d_shape} lora_u={u_shape}: {_e}"
         ) from _e
 
 
@@ -241,7 +243,8 @@ class _GGUFCompilePatch:
 
     def remove(self) -> None:
         self._module.forward = self._orig_forward
-        for attr in ('_lora_factors', '_gguf_compile_dt', '_gguf_compile_dev',
+        for attr in ('_lora_factors', '_lora_d', '_lora_u',
+                     '_gguf_compile_dt', '_gguf_compile_dev',
                      '_gguf_compile_is_fp8'):
             try:
                 delattr(self._module, attr)
@@ -271,17 +274,34 @@ def _quantized_compile_forward(self, x):
     """Compile-friendly forward for non-GGUF quantized modules.
 
     Calls the original quantized forward, then adds LoRA delta via
-    output-space addition.  LoRA factors stored as module attributes
-    (_lora_factors) — NOT closure variables — so torch.compile sees
-    one graph structure for all blocks (stable guards, cache-friendly).
-
-    Matches OneTrainer's LoRAModule.forward pattern:
-      return orig_forward(x) + lora_up(lora_down(x)) * scale
+    output-space addition.  Uses pre-merged factors (_lora_d / _lora_u)
+    so the cost is ONE matmul pair regardless of how many LoRAs are
+    stacked — not 2*N matmuls.
     """
     y = self._orig_forward_for_lora(x)
-    for dv, uv, s in self._lora_factors:
-        y = y + F.linear(F.linear(x, dv), uv) * s
+    if self._lora_d is not None:
+        y = y + F.linear(F.linear(x, self._lora_d), self._lora_u)
     return y
+
+
+def _rebuild_merged_lora(module: torch.nn.Module) -> None:
+    """Merge all LoRA factors into a single (D, U) pair via concatenation.
+
+    Given N LoRAs with factors (d_i, u_i, s_i):
+      D_merged = cat([d_1, d_2, …], dim=0)           # [sum(ranks), in_dim]
+      U_merged = cat([u_1*s_1, u_2*s_2, …], dim=1)   # [out_dim, sum(ranks)]
+
+    Then U_merged @ D_merged = sum(u_i @ d_i * s_i) in one matmul.
+    """
+    factors = getattr(module, '_lora_factors', [])
+    if not factors:
+        module._lora_d = None
+        module._lora_u = None
+        return
+    ds = [dv for dv, _, _ in factors]
+    us = [uv * s for _, uv, s in factors]
+    module._lora_d = torch.cat(ds, dim=0)   # [sum(ranks), in_dim]
+    module._lora_u = torch.cat(us, dim=1)   # [out_dim, sum(ranks)]
 
 
 class _QuantizedCompilePatch:
@@ -298,7 +318,8 @@ class _QuantizedCompilePatch:
 
     def remove(self) -> None:
         self._module.forward = self._orig_forward
-        for attr in ('_lora_factors', '_orig_forward_for_lora'):
+        for attr in ('_lora_factors', '_lora_d', '_lora_u',
+                     '_orig_forward_for_lora'):
             try:
                 delattr(self._module, attr)
             except AttributeError:
@@ -492,6 +513,7 @@ def apply_lora_hooks(
             dv = d.to(device=dev, dtype=dt)
             uv = u.to(device=dev, dtype=dt)
             module._lora_factors.append((dv, uv, scale))
+            _rebuild_merged_lora(module)
             gguf_count += 1
 
             if gguf_count == 1 and on_log:
@@ -518,6 +540,7 @@ def apply_lora_hooks(
             dv = d.to(device=dev, dtype=dt)
             uv = u.to(device=dev, dtype=dt)
             module._lora_factors.append((dv, uv, scale))
+            _rebuild_merged_lora(module)
             qcomp_count += 1
 
             if qcomp_count == 1 and on_log:
