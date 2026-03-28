@@ -127,10 +127,8 @@ def _gguf_compile_forward_int8(self, x):
     w = w.to(device=self._gguf_compile_dev, dtype=dt)
 
     # Compiled: merge pre-concatenated LoRA delta onto dequantized weight.
-    # Factors live on CPU; moved to compute device on demand (ComfyUI-style).
     if self._lora_d is not None:
-        dev = w.device
-        w = w + self._lora_u.to(dev, non_blocking=True) @ self._lora_d.to(dev, non_blocking=True)
+        w = w + self._lora_u @ self._lora_d
 
     # Compiled: int8 quantized matmul (same as original A8I path)
     # All ops are standard torch — _int_mm is a built-in ATen op.
@@ -183,8 +181,7 @@ def _gguf_compile_forward_fp8(self, x):
 
         # Compiled: merge pre-concatenated LoRA delta onto dequantized weight.
         if self._lora_d is not None:
-            dev = w.device
-            w = w + self._lora_u.to(dev, non_blocking=True) @ self._lora_d.to(dev, non_blocking=True)
+            w = w + self._lora_u @ self._lora_d
 
         bias = self.bias
         if bias is not None:
@@ -277,15 +274,12 @@ def _quantized_compile_forward(self, x):
     Calls the original quantized forward, then adds LoRA delta via
     output-space addition.  Uses pre-merged factors (_lora_d / _lora_u)
     so the cost is ONE matmul pair regardless of how many LoRAs are
-    stacked.  Factors live on CPU and are moved to the compute device
-    on demand (ComfyUI-style), so only the active layer's LoRA
-    consumes VRAM.
+    stacked.  Factors are moved to the compute device per-transformer
+    (not per-layer) via move_lora_factors_to_device().
     """
     y = self._orig_forward_for_lora(x)
     if self._lora_d is not None:
-        dev = x.device
-        y = y + F.linear(F.linear(x, self._lora_d.to(dev, non_blocking=True)),
-                         self._lora_u.to(dev, non_blocking=True))
+        y = y + F.linear(F.linear(x, self._lora_d), self._lora_u)
     return y
 
 
@@ -298,10 +292,9 @@ def _rebuild_merged_lora(module: torch.nn.Module) -> None:
 
     Then U_merged @ D_merged = sum(u_i @ d_i * s_i) in one matmul.
 
-    Merged tensors are stored on CPU in pinned memory (ComfyUI-style).
-    The forward functions move them to the compute device on demand
-    with non_blocking=True so only the active layer's LoRA factors
-    consume VRAM, and the transfer overlaps with GPU computation.
+    Merged tensors are stored on CPU initially.  Call
+    move_lora_factors_to_device() to move a transformer's factors to
+    GPU before sampling (per-transformer, not per-layer).
     """
     factors = getattr(module, '_lora_factors', [])
     if not factors:
@@ -310,16 +303,22 @@ def _rebuild_merged_lora(module: torch.nn.Module) -> None:
         return
     ds = [dv for dv, _, _ in factors]
     us = [uv * s for _, uv, s in factors]
-    d_merged = torch.cat(ds, dim=0).cpu()
-    u_merged = torch.cat(us, dim=1).cpu()
-    # Pinned memory enables fast DMA transfers (~2x vs unpinned).
-    try:
-        module._lora_d = d_merged.pin_memory()
-        module._lora_u = u_merged.pin_memory()
-    except RuntimeError:
-        # pin_memory can fail if CUDA isn't available or limit exceeded
-        module._lora_d = d_merged
-        module._lora_u = u_merged
+    module._lora_d = torch.cat(ds, dim=0).cpu()
+    module._lora_u = torch.cat(us, dim=1).cpu()
+
+
+def move_lora_factors_to_device(transformer: torch.nn.Module, device: torch.device) -> None:
+    """Move all LoRA merged factors in a transformer to the given device.
+
+    Call with train_device before sampling a transformer, and temp_device
+    after, so only the active transformer's factors consume VRAM.
+    For single-transformer models (Chroma), call once with train_device.
+    """
+    for module in transformer.modules():
+        d = getattr(module, '_lora_d', None)
+        if d is not None and d.device != device:
+            module._lora_d = module._lora_d.to(device, non_blocking=True)
+            module._lora_u = module._lora_u.to(device, non_blocking=True)
 
 
 class _QuantizedCompilePatch:

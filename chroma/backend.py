@@ -20,7 +20,7 @@ from sampler_core.util.ot_bridge import find_ot_quant_cache
 from sampler_core.util.png_meta import write_png_metadata
 from sampler_core.util.tokenizer_patch import patch_tokenizer_no_truncate
 from sampler_core.util.resolution import ATTN_BACKEND_ENUM_NAME, check_attn_backends
-from sampler_core.lora.hooks import apply_lora_hooks
+from sampler_core.lora.hooks import apply_lora_hooks, move_lora_factors_to_device
 from chroma.lora_keys import make_chroma_translator, expand_lora_unet_fused, expand_diffusion_model_fused
 
 from modules.model.ChromaModel import ChromaModel
@@ -421,6 +421,10 @@ class ChromaBackend(BaseSamplerBackend):
             # — no need to swap to eager.
             self._ensure_blocks_compiled()
             # --------------------------------------------------------------
+
+            # Move LoRA factors to GPU for the single transformer.
+            if self.lora_hooks:
+                move_lora_factors_to_device(self.model.transformer, self.train_device)
 
             sampler = ChromaSampler(
                 self.train_device, self.temp_device,

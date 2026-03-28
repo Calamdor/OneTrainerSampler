@@ -20,7 +20,7 @@ from sampler_core.util.ot_bridge import find_ot_quant_cache
 from sampler_core.util.png_meta import write_png_metadata, write_png_sidecar, write_mp4_metadata
 from sampler_core.util.tokenizer_patch import patch_tokenizer_no_truncate
 from sampler_core.util.resolution import ATTN_BACKEND_ENUM_NAME, check_attn_backends
-from sampler_core.lora.hooks import apply_lora_hooks
+from sampler_core.lora.hooks import apply_lora_hooks, move_lora_factors_to_device
 from wan.lora_keys import make_wan_translator, _detect_expert_from_filename
 
 from modules.model.WanModel import WanModel
@@ -439,6 +439,14 @@ class WanBackend(BaseSamplerBackend):
             # — no need to swap to eager.
             self._ensure_blocks_compiled()
             # --------------------------------------------------------------
+
+            # Move LoRA factors to GPU for both transformers.  The factors
+            # are small (rank × dim); the weight offload conductor handles
+            # the large weight tensors.  WanSampler switches experts via
+            # transformer_1_to / transformer_2_to internally.
+            if self.lora_hooks:
+                move_lora_factors_to_device(self.model.transformer, self.train_device)
+                move_lora_factors_to_device(self.model.transformer_2, self.train_device)
 
             # ---- UMT5 embedding cache ------------------------------------
             # WanSampler calls encode_text TWICE per generation: once for the
