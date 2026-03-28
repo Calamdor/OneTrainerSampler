@@ -36,6 +36,8 @@ DEFAULTS = {
     "svd_enabled":        False,
     "svd_rank":           16,
     "svd_dtype":          "BF16",
+    "quant_layer_filter":        "",
+    "quant_layer_filter_preset": "full",
     "quant_cache_dir":    "",
     "use_compile":        False,
     "compute_dtype":      "Auto",
@@ -270,6 +272,41 @@ class WanSamplerApp(BaseSamplerApp):
         self._svd_row_widgets = [_svd_chk, _lbl_rank, _svd_spin, _lbl_res, _svd_combo]
 
         r += 1
+        _LAYER_PRESETS = ["full", "blocks", "attn-mlp", "attn-only"]
+        _LAYER_PRESET_FILTERS = {
+            "full": "", "blocks": "blocks",
+            "attn-mlp": "attn,ffn", "attn-only": "attn",
+        }
+        qf_row = ttk.Frame(model_frame)
+        qf_row.grid(row=r, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(qf_row, text="Quant layer filter:").pack(side="left")
+        self._qf_preset_var = tk.StringVar(
+            value=self.cfg.get("quant_layer_filter_preset", "full"))
+        _qf_combo = ttk.Combobox(qf_row, textvariable=self._qf_preset_var,
+                                 values=_LAYER_PRESETS, state="readonly", width=10)
+        _qf_combo.pack(side="left", padx=4)
+        Tooltip(_qf_combo,
+            "Preset defining which layers to quantize.\n\n"
+            "full — quantize all linear layers (default)\n"
+            "blocks — transformer blocks only (skip embedders/proj_out)\n"
+            "attn-mlp — attention + MLP layers only\n"
+            "attn-only — attention layers only\n\n"
+            "Selecting a preset fills the custom filter box.")
+        self._qf_entry_var = tk.StringVar(
+            value=self.cfg.get("quant_layer_filter", ""))
+        _qf_entry = ttk.Entry(qf_row, textvariable=self._qf_entry_var, width=30)
+        _qf_entry.pack(side="left", padx=4)
+        Tooltip(_qf_entry,
+            "Custom comma-separated layer filter for quantization.\n"
+            "Any linear layer whose name contains one of these substrings\n"
+            "will be quantized; others stay in the base weight dtype.\n\n"
+            "Leave empty to quantize all layers (same as 'full' preset).")
+        def _on_preset_change(*_):
+            preset = self._qf_preset_var.get()
+            self._qf_entry_var.set(_LAYER_PRESET_FILTERS.get(preset, ""))
+        _qf_combo.bind("<<ComboboxSelected>>", _on_preset_change)
+
+        r += 1
         self._model_status_var = tk.StringVar(value="Not loaded — will load on first job")
         self._model_status_label = tk.Label(
             model_frame, textvariable=self._model_status_var, foreground="gray",
@@ -470,6 +507,8 @@ class WanSamplerApp(BaseSamplerApp):
             "svd_enabled":        self._svd_var.get(),
             "svd_rank":           self._svd_rank_var.get(),
             "svd_dtype":          self._svd_dtype_var.get(),
+            "quant_layer_filter":        self._qf_entry_var.get(),
+            "quant_layer_filter_preset": self._qf_preset_var.get(),
             "quant_cache_dir":    self._cache_var.get(),
             "use_compile":        self._compile_var.get(),
             "compute_dtype":      self._compute_dtype_var.get(),

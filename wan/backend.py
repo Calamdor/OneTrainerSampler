@@ -66,8 +66,8 @@ class WanBackend(BaseSamplerBackend):
         "base_model_path", "weight_dtype", "text_enc_dtype",
         "svd_enabled", "svd_rank", "svd_dtype",
         "transformer_1_gguf", "transformer_2_gguf", "quant_cache_dir",
-        "use_compile", "compute_dtype", "fast_fp16_accum",
-        "offload_enabled", "offload_fraction",
+        "quant_layer_filter", "use_compile", "compute_dtype",
+        "fast_fp16_accum", "offload_enabled", "offload_fraction",
     )
 
     # ------------------------------------------------------------------
@@ -204,6 +204,7 @@ class WanBackend(BaseSamplerBackend):
 
         from modules.util.config.TrainConfig import QuantizationConfig
         quantization = QuantizationConfig.default_values()
+        quantization.layer_filter = cfg.get("quant_layer_filter", "")
         if svd_enabled:
             quantization.svd_dtype = SVD_DTYPE_MAP.get(svd_dtype_str, DataType.BFLOAT_16)
             quantization.svd_rank  = svd_rank
