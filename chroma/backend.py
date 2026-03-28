@@ -78,21 +78,16 @@ class ChromaBackend(BaseSamplerBackend):
         preserved — critical for the offload path where _kwargs_to_args
         introspects the block's forward signature.
 
-        fullgraph selection:
-          - GGUF: fullgraph=False — dequant is a torch.compiler.disable
-            graph break, incompatible with fullgraph=True.
-          - Everything else (NF4, INT8, FP8, W8A8*, BF16, FP16, FP32):
-            fullgraph=True — matches OneTrainer; traces INTO custom
-            autograd Functions so dynamo sees only standard torch ops.
+        Always fullgraph=True, matching OneTrainer.  All weight types are
+        compatible: GGUF dequant uses only standard torch ops (no
+        torch.compiler.disable wrapper), and quantized types (W8A8*,
+        NF4, FP8, INT8) use custom autograd Functions that dynamo traces
+        into seeing only standard ops.
         """
         if not getattr(self, '_compile_deferred', False):
             return
         if self.model is None:
             return
-
-        cfg = self._loaded_cfg or {}
-        is_gguf = cfg.get("weight_dtype", "") in {"GGUF", "GGUF_A8I", "GGUF_A8F"}
-        fg = not is_gguf
 
         for blk_list in (self.model.transformer.transformer_blocks,
                          self.model.transformer.single_transformer_blocks):
@@ -104,13 +99,13 @@ class ChromaBackend(BaseSamplerBackend):
                         isinstance(block.checkpoint, torch.nn.Module):
                     if hasattr(block.checkpoint, '_compiled_call_impl'):
                         continue  # already compiled; cache was reset by remove_loras()
-                    block.checkpoint.compile(fullgraph=fg)
+                    block.checkpoint.compile(fullgraph=True)
                     continue
 
                 # No-offload path: compile the block directly (in-place).
                 if hasattr(block, '_compiled_call_impl'):
                     continue
-                block.compile(fullgraph=fg)
+                block.compile(fullgraph=True)
 
     # ------------------------------------------------------------------
     def load_model(self, cfg: dict, on_status) -> None:

@@ -13,8 +13,8 @@ layers (NF4, W4A16, GGUF, …) use one of two strategies:
      merge LoRA onto the dequantized float, call F.linear.  LoRA factors
      stored as module attributes (not closure variables) so torch.compile
      guards are stable and persistent disk cache works across sessions.
-     The dequant call is a single graph break; LoRA merge + F.linear are
-     fused in the compiled graph.
+     The dequant function uses only standard torch ops, so dynamo traces
+     through it cleanly with fullgraph=True (matching OneTrainer).
 
   2. Forward-patch path (compile_friendly=False, legacy):
      Replaces module.forward with a wrapper closure.  Works but closures
@@ -97,16 +97,14 @@ def _is_gguf_module(module: torch.nn.Module) -> bool:
 def _gguf_dequant_weight(weight):
     """Dequantize a GGUF weight tensor.
 
-    Uses the gguf library's dequantize_gguf_tensor, wrapped in
-    torch.compiler.disable so it's a clean, single graph break.
-    The LoRA merge and F.linear that follow are fully compiled.
+    NOT wrapped in torch.compiler.disable — dequantize_gguf_tensor uses
+    only standard torch ops (view, reshape, bitwise, arithmetic) that
+    dynamo traces through cleanly.  This matches OneTrainer's
+    LinearGGUFA8.forward() which also calls dequantize_gguf_tensor
+    without a compiler disable, allowing fullgraph=True compilation.
     """
     from diffusers.quantizers.gguf.utils import dequantize_gguf_tensor
     return dequantize_gguf_tensor(weight.detach())
-
-
-# Wrap at definition time so the decorator object has stable identity
-_gguf_dequant_weight = torch.compiler.disable(_gguf_dequant_weight)
 
 
 def _gguf_compile_forward_int8(self, x):
@@ -393,7 +391,7 @@ def apply_lora_hooks(
         if root is None:
             continue
         try:
-            module = get_module_by_dotpath(root, mod_path, on_log)
+            module = get_module_by_dotpath(root, mod_path)
         except AttributeError:
             if on_log:
                 on_log(f"[MODULE-LOOKUP-FAIL] {target}:{mod_path} — AttributeError")
@@ -462,7 +460,11 @@ def apply_lora_hooks(
             # ---- Fallback: forward method patch (closure-based) ----------------
             def _make_patch(orig_fwd, down, up, s, mod, hint_dev):
                 w   = getattr(mod, "weight", None)
-                if w is not None and w.dtype.is_floating_point:
+                # Use hint_device (GPU) for quantized weights — their .device
+                # is CPU at injection time.  Only trust w.device for plain
+                # float types (bf16/fp16/fp32) that _can_merge would accept.
+                _PLAIN_FLOAT = (torch.float16, torch.bfloat16, torch.float32)
+                if w is not None and w.dtype in _PLAIN_FLOAT:
                     dev = w.device
                 elif hint_dev is not None:
                     dev = hint_dev
@@ -470,7 +472,7 @@ def apply_lora_hooks(
                     dev = torch.device("cpu")
                 dt  = getattr(mod, "compute_dtype", None)
                 if dt is None:
-                    dt = (w.dtype if (w is not None and w.dtype.is_floating_point)
+                    dt = (w.dtype if (w is not None and w.dtype in _PLAIN_FLOAT)
                           else torch.bfloat16)
                 dv = down.to(device=dev, dtype=dt)
                 uv = up.to(device=dev, dtype=dt)
