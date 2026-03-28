@@ -485,10 +485,11 @@ def apply_lora_hooks(
             hook_count += 1
             if hook_count == 1 and on_log:
                 w2   = getattr(module, "weight", None)
-                dev2 = (w2.device if (w2 is not None and w2.dtype.is_floating_point)
+                _PLAIN = (torch.float16, torch.bfloat16, torch.float32)
+                dev2 = (w2.device if (w2 is not None and w2.dtype in _PLAIN)
                         else hint_device or "cpu")
                 dt2  = getattr(module, "compute_dtype", None) or (
-                    w2.dtype if (w2 is not None and w2.dtype.is_floating_point)
+                    w2.dtype if (w2 is not None and w2.dtype in _PLAIN)
                     else torch.bfloat16)
                 on_log(f"[LoRA] patch device={dev2} dtype={dt2}")
 

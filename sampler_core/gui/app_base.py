@@ -1187,6 +1187,9 @@ class BaseSamplerApp(ABC):
                 _s0      = [None]   # step value of first callback
                 _tlast   = [None]   # time of previous callback (per-step timing)
                 _baseline = [None]  # median step time after warmup, for recompile detection
+                # Wan expert transition: step where high→low expert switch
+                # triggers lazy compilation of the second transformer.
+                _steps_high = cfg.get("steps_high") if cfg.get("steps_low", 0) > 0 else None
 
                 def _prog(step, t):
                     now = time.monotonic()
@@ -1219,7 +1222,10 @@ class BaseSamplerApp(ABC):
                         flag = ""
                         if (_baseline[0] is not None and steps_done > 1
                                 and step_dt > _baseline[0] * 2.0):
-                            flag = "  *** SLOW — possible recompile"
+                            if _steps_high is not None and step == _steps_high + 1:
+                                flag = "  — expert transition (compile warmup)"
+                            else:
+                                flag = "  *** SLOW — possible recompile"
                         self.root.after(0, self._append_log,
                                         f"[step]  {step}/{t}  {step_dt:.2f}s{flag}")
                     self.root.after(0, lambda s=step, tt=t, lbl=label: (
