@@ -264,7 +264,49 @@ class _GGUFFactorRef:
 
 
 # ---------------------------------------------------------------------------
-# Forward patch path (legacy — for non-GGUF quantized modules)
+# Quantized compile-friendly path (non-GGUF quantized modules)
+# ---------------------------------------------------------------------------
+
+def _quantized_compile_forward(self, x):
+    """Compile-friendly forward for non-GGUF quantized modules.
+
+    Calls the original quantized forward, then adds LoRA delta via
+    output-space addition.  LoRA factors stored as module attributes
+    (_lora_factors) — NOT closure variables — so torch.compile sees
+    one graph structure for all blocks (stable guards, cache-friendly).
+
+    Matches OneTrainer's LoRAModule.forward pattern:
+      return orig_forward(x) + lora_up(lora_down(x)) * scale
+    """
+    y = self._orig_forward_for_lora(x)
+    for dv, uv, s in self._lora_factors:
+        y = y + F.linear(F.linear(x, dv), uv) * s
+    return y
+
+
+class _QuantizedCompilePatch:
+    """Compile-friendly LoRA patch for non-GGUF quantized modules.
+
+    Same pattern as _GGUFCompilePatch: module attributes + shared forward.
+    remove() restores the original forward and cleans up all factors.
+    """
+    __slots__ = ("_module", "_orig_forward")
+
+    def __init__(self, module: torch.nn.Module, orig_forward):
+        self._module = module
+        self._orig_forward = orig_forward
+
+    def remove(self) -> None:
+        self._module.forward = self._orig_forward
+        for attr in ('_lora_factors', '_orig_forward_for_lora'):
+            try:
+                delattr(self._module, attr)
+            except AttributeError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Forward patch path (legacy — for non-compiled quantized modules)
 # ---------------------------------------------------------------------------
 
 class _ForwardPatch:
@@ -382,6 +424,7 @@ def apply_lora_hooks(
     fail_count = 0
     merge_count = 0
     hook_count = 0
+    qcomp_count = 0
     gguf_count = 0
 
     for (target, mod_path), lora in loras.items():
@@ -454,13 +497,37 @@ def apply_lora_hooks(
             if gguf_count == 1 and on_log:
                 on_log(f"[LoRA] GGUF compile-friendly: device={dev} dtype={dt}")
 
+        elif compile_friendly:
+            # ---- Quantized compile-friendly path (non-GGUF) ------------------
+            # Same principle as GGUF path: store LoRA factors as module
+            # attributes + shared forward function.  Dynamo sees one graph
+            # structure for all blocks → single compiled graph instead of
+            # N unique closure-based graphs.
+            dev = hint_device or torch.device("cuda")
+            dt = getattr(module, "compute_dtype", None) or torch.bfloat16
+
+            if not hasattr(module, '_lora_factors'):
+                orig_fwd = module.forward
+                module._lora_factors = []
+                module._orig_forward_for_lora = orig_fwd
+                module.forward = types.MethodType(_quantized_compile_forward, module)
+                handles.append(_QuantizedCompilePatch(module, orig_fwd))
+            else:
+                handles.append(_GGUFFactorRef())
+
+            dv = d.to(device=dev, dtype=dt)
+            uv = u.to(device=dev, dtype=dt)
+            module._lora_factors.append((dv, uv, scale))
+            qcomp_count += 1
+
+            if qcomp_count == 1 and on_log:
+                on_log(f"[LoRA] compile-friendly: device={dev} dtype={dt}")
+
         else:
             # ---- Fallback: forward method patch (closure-based) ----------------
+            # Used when compile_friendly=False (no torch.compile).
             def _make_patch(orig_fwd, down, up, s, mod, hint_dev):
                 w   = getattr(mod, "weight", None)
-                # Use hint_device (GPU) for quantized weights — their .device
-                # is CPU at injection time.  Only trust w.device for plain
-                # float types (bf16/fp16/fp32) that _can_merge would accept.
                 _PLAIN_FLOAT = (torch.float16, torch.bfloat16, torch.float32)
                 if w is not None and w.dtype in _PLAIN_FLOAT:
                     dev = w.device
@@ -496,7 +563,7 @@ def apply_lora_hooks(
     # ---- Logging -------------------------------------------------------
     _log = on_log if on_log is not None else print
     total_parsed = len(loras)
-    ok_count = merge_count + hook_count + gguf_count
+    ok_count = merge_count + hook_count + qcomp_count + gguf_count
     if total_parsed == 0:
         _log("[LoRA] no LoRA entries parsed — check key format")
         for k in list(state_dict.keys())[:8]:
@@ -522,6 +589,8 @@ def apply_lora_hooks(
             parts.append(f"{merge_count} weight-merged")
         if gguf_count:
             parts.append(f"{gguf_count} gguf-compile")
+        if qcomp_count:
+            parts.append(f"{qcomp_count} compile-friendly")
         if hook_count:
             parts.append(f"{hook_count} forward-patched")
         if skipped:
