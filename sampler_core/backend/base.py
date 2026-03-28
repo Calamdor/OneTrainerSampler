@@ -165,7 +165,6 @@ class BaseSamplerBackend(ABC):
 
     def apply_loras(self, loras: list[dict], on_status) -> None:
         def _status(msg: str) -> None:
-            print(msg)
             on_status(msg)
 
         if self.model is None:

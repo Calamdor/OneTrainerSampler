@@ -453,8 +453,6 @@ def apply_lora_hooks(
 
             if gguf_count == 1 and on_log:
                 on_log(f"[LoRA] GGUF compile-friendly: device={dev} dtype={dt}")
-            elif gguf_count % 50 == 0 and on_log:
-                on_log(f"[LoRA-GGUF-PROGRESS] {gguf_count} layers patched")
 
         else:
             # ---- Fallback: forward method patch (closure-based) ----------------

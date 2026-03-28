@@ -98,13 +98,13 @@ class WanBackend(BaseSamplerBackend):
                 # Offload path: compile the INNER block, not the wrapper.
                 if hasattr(block, 'checkpoint') and \
                         isinstance(block.checkpoint, torch.nn.Module):
-                    if hasattr(block.checkpoint, '_compiled_call_impl'):
+                    if block.checkpoint._compiled_call_impl is not None:
                         continue  # already compiled; cache was reset by remove_loras()
                     block.checkpoint.compile(fullgraph=True)
                     continue
 
                 # No-offload path: compile the block directly (in-place).
-                if hasattr(block, '_compiled_call_impl'):
+                if block._compiled_call_impl is not None:
                     continue
                 block.compile(fullgraph=True)
 
