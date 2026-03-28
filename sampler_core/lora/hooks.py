@@ -127,10 +127,10 @@ def _gguf_compile_forward_int8(self, x):
     w = w.to(device=self._gguf_compile_dev, dtype=dt)
 
     # Compiled: merge pre-concatenated LoRA delta onto dequantized weight.
-    # _lora_u @ _lora_d: [out_dim, sum(ranks)] @ [sum(ranks), in_dim]
-    # Single matmul regardless of how many LoRAs are stacked.
+    # Factors live on CPU; moved to compute device on demand (ComfyUI-style).
     if self._lora_d is not None:
-        w = w + self._lora_u @ self._lora_d
+        dev = w.device
+        w = w + self._lora_u.to(dev) @ self._lora_d.to(dev)
 
     # Compiled: int8 quantized matmul (same as original A8I path)
     # All ops are standard torch — _int_mm is a built-in ATen op.
@@ -183,7 +183,8 @@ def _gguf_compile_forward_fp8(self, x):
 
         # Compiled: merge pre-concatenated LoRA delta onto dequantized weight.
         if self._lora_d is not None:
-            w = w + self._lora_u @ self._lora_d
+            dev = w.device
+            w = w + self._lora_u.to(dev) @ self._lora_d.to(dev)
 
         bias = self.bias
         if bias is not None:
@@ -276,11 +277,14 @@ def _quantized_compile_forward(self, x):
     Calls the original quantized forward, then adds LoRA delta via
     output-space addition.  Uses pre-merged factors (_lora_d / _lora_u)
     so the cost is ONE matmul pair regardless of how many LoRAs are
-    stacked — not 2*N matmuls.
+    stacked.  Factors live on CPU and are moved to the compute device
+    on demand (ComfyUI-style), so only the active layer's LoRA
+    consumes VRAM.
     """
     y = self._orig_forward_for_lora(x)
     if self._lora_d is not None:
-        y = y + F.linear(F.linear(x, self._lora_d), self._lora_u)
+        dev = x.device
+        y = y + F.linear(F.linear(x, self._lora_d.to(dev)), self._lora_u.to(dev))
     return y
 
 
@@ -292,6 +296,10 @@ def _rebuild_merged_lora(module: torch.nn.Module) -> None:
       U_merged = cat([u_1*s_1, u_2*s_2, …], dim=1)   # [out_dim, sum(ranks)]
 
     Then U_merged @ D_merged = sum(u_i @ d_i * s_i) in one matmul.
+
+    Merged tensors are stored on CPU (ComfyUI-style).  The forward
+    functions move them to the compute device on demand so only the
+    active layer's LoRA factors consume VRAM at any given time.
     """
     factors = getattr(module, '_lora_factors', [])
     if not factors:
@@ -300,8 +308,8 @@ def _rebuild_merged_lora(module: torch.nn.Module) -> None:
         return
     ds = [dv for dv, _, _ in factors]
     us = [uv * s for _, uv, s in factors]
-    module._lora_d = torch.cat(ds, dim=0)   # [sum(ranks), in_dim]
-    module._lora_u = torch.cat(us, dim=1)   # [out_dim, sum(ranks)]
+    module._lora_d = torch.cat(ds, dim=0).cpu()   # [sum(ranks), in_dim]
+    module._lora_u = torch.cat(us, dim=1).cpu()   # [out_dim, sum(ranks)]
 
 
 class _QuantizedCompilePatch:
@@ -488,15 +496,13 @@ def apply_lora_hooks(
 
         elif compile_friendly and _is_gguf_module(module):
             # ---- GGUF compile-friendly path ----------------------------------
-            # ComfyUI-style: dequant → merge LoRA → F.linear.
-            # LoRA factors stored as module attributes, not closure variables.
-            # One graph break per linear (dequant), LoRA merge + F.linear compiled.
+            # Dequant → merge LoRA → int8/fp8 matmul.  LoRA factors stored as
+            # module attributes on CPU (ComfyUI-style); moved to compute device
+            # on demand in the forward so only the active layer's factors use VRAM.
             dev = hint_device or torch.device("cuda")
             dt = getattr(module, "compute_dtype", None) or torch.bfloat16
 
             if not hasattr(module, '_lora_factors'):
-                # First LoRA on this module: set up compile-friendly forward.
-                # Dispatch to fp8 or int8 variant based on module._dtype.
                 orig_fwd = module.forward
                 module._lora_factors = []
                 module._gguf_compile_dt = dt
@@ -507,11 +513,11 @@ def apply_lora_hooks(
                 module.forward = types.MethodType(forward_fn, module)
                 handles.append(_GGUFCompilePatch(module, orig_fwd))
             else:
-                # Additional LoRA on same module: lightweight ref handle
                 handles.append(_GGUFFactorRef())
 
-            dv = d.to(device=dev, dtype=dt)
-            uv = u.to(device=dev, dtype=dt)
+            # Store on CPU; forward moves to GPU on demand.
+            dv = d.to(dtype=dt)
+            uv = u.to(dtype=dt)
             module._lora_factors.append((dv, uv, scale))
             _rebuild_merged_lora(module)
             gguf_count += 1
@@ -521,11 +527,8 @@ def apply_lora_hooks(
 
         elif compile_friendly:
             # ---- Quantized compile-friendly path (non-GGUF) ------------------
-            # Same principle as GGUF path: store LoRA factors as module
-            # attributes + shared forward function.  Dynamo sees one graph
-            # structure for all blocks → single compiled graph instead of
-            # N unique closure-based graphs.
-            dev = hint_device or torch.device("cuda")
+            # LoRA factors as module attributes + shared forward.  Factors on
+            # CPU, moved to compute device on demand (ComfyUI-style).
             dt = getattr(module, "compute_dtype", None) or torch.bfloat16
 
             if not hasattr(module, '_lora_factors'):
@@ -537,8 +540,9 @@ def apply_lora_hooks(
             else:
                 handles.append(_GGUFFactorRef())
 
-            dv = d.to(device=dev, dtype=dt)
-            uv = u.to(device=dev, dtype=dt)
+            # Store on CPU; forward moves to GPU on demand.
+            dv = d.to(dtype=dt)
+            uv = u.to(dtype=dt)
             module._lora_factors.append((dv, uv, scale))
             _rebuild_merged_lora(module)
             qcomp_count += 1
