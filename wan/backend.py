@@ -440,13 +440,26 @@ class WanBackend(BaseSamplerBackend):
             self._ensure_blocks_compiled()
             # --------------------------------------------------------------
 
-            # Move LoRA factors to GPU for both transformers.  The factors
-            # are small (rank × dim); the weight offload conductor handles
-            # the large weight tensors.  WanSampler switches experts via
-            # transformer_1_to / transformer_2_to internally.
+            # ---- LoRA factor device management -----------------------------
+            # Patch transformer_1_to / transformer_2_to so LoRA factors move
+            # with the expert.  Only the active transformer's factors consume
+            # VRAM; the other's stay on CPU.
+            _lora_device_patch = False
             if self.lora_hooks:
-                move_lora_factors_to_device(self.model.transformer, self.train_device)
-                move_lora_factors_to_device(self.model.transformer_2, self.train_device)
+                _orig_t1_to = self.model.transformer_1_to
+                _orig_t2_to = self.model.transformer_2_to
+                _xfmr1 = self.model.transformer
+                _xfmr2 = self.model.transformer_2
+                def _patched_t1_to(device):
+                    _orig_t1_to(device)
+                    move_lora_factors_to_device(_xfmr1, device)
+                def _patched_t2_to(device):
+                    _orig_t2_to(device)
+                    move_lora_factors_to_device(_xfmr2, device)
+                self.model.transformer_1_to = _patched_t1_to
+                self.model.transformer_2_to = _patched_t2_to
+                _lora_device_patch = True
+            # --------------------------------------------------------------
 
             # ---- UMT5 embedding cache ------------------------------------
             # WanSampler calls encode_text TWICE per generation: once for the
@@ -556,6 +569,9 @@ class WanBackend(BaseSamplerBackend):
             finally:
                 _ws_mod.tqdm = _orig_ws_tqdm
                 self.model.noise_scheduler = _orig_scheduler
+                if _lora_device_patch:
+                    self.model.transformer_1_to = _orig_t1_to
+                    self.model.transformer_2_to = _orig_t2_to
                 if _et_patched:
                     self.model.encode_text = _et_orig
                 if _te_to_orig is not None:
