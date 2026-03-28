@@ -523,7 +523,7 @@ def apply_lora_hooks(
             gguf_count += 1
 
             if gguf_count == 1 and on_log:
-                on_log(f"[LoRA] GGUF compile-friendly: device={dev} dtype={dt}")
+                on_log(f"[LoRA] GGUF compile-friendly: dtype={dt} (factors on CPU)")
 
         elif compile_friendly:
             # ---- Quantized compile-friendly path (non-GGUF) ------------------
@@ -548,7 +548,7 @@ def apply_lora_hooks(
             qcomp_count += 1
 
             if qcomp_count == 1 and on_log:
-                on_log(f"[LoRA] compile-friendly: device={dev} dtype={dt}")
+                on_log(f"[LoRA] compile-friendly: dtype={dt} (factors on CPU)")
 
         else:
             # ---- Fallback: forward method patch (closure-based) ----------------
