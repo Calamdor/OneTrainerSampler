@@ -419,6 +419,11 @@ class WanBackend(BaseSamplerBackend):
                 else nullcontext()
             )
 
+            # Wrap SageAttention in custom_op for fullgraph=True compat.
+            if attn_str == "SageAttn":
+                from sampler_core.util.sage_compile import patch_sage_attention
+                patch_sage_attention()
+
             # ---- scheduler swap ------------------------------------------
             # Wan2.2 calculates sigma shift automatically from the model config;
             # we preserve the original shift and only swap the scheduler class.
@@ -574,6 +579,9 @@ class WanBackend(BaseSamplerBackend):
             finally:
                 _ws_mod.tqdm = _orig_ws_tqdm
                 self.model.noise_scheduler = _orig_scheduler
+                if attn_str == "SageAttn":
+                    from sampler_core.util.sage_compile import unpatch_sage_attention
+                    unpatch_sage_attention()
                 if _offload_patched:
                     _qu.offload_quantized = _orig_offload_q
                     _loc.offload_quantized = _orig_offload_q
