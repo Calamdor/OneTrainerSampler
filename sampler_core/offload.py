@@ -20,5 +20,5 @@ class OffloadConfig:
         self.layer_offload_fraction    = float(layer_offload_fraction)
         self.gradient_checkpointing    = GradientCheckpointingMethod.CPU_OFFLOADED
         self.enable_activation_offloading = False
-        self.enable_async_offloading   = False
+        self.enable_async_offloading   = True
         self.compile                   = use_compile
