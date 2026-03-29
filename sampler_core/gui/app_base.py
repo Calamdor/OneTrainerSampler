@@ -1243,14 +1243,13 @@ class BaseSamplerApp(ABC):
                             label = f"{step}/{t}  {rate_str}  ETA {m}:{s_rem:02d}"
                         else:
                             label = f"{step}/{t}"
-                        # Establish baseline from first post-warmup step (step 2+).
-                        # Flag only when the current step is >2× the baseline —
-                        # this detects genuine recompile events without triggering
-                        # on normal GGUF / quantised-model operation speed.
-                        if steps_done == 1:
-                            _baseline[0] = step_dt   # first steady-state sample
+                        # Establish baseline from step 3+ (steps_done>=2).
+                        # Step 2 is often anomalously fast (compile cache warming).
+                        # Flag only when the current step is >2× the baseline.
+                        if steps_done == 2:
+                            _baseline[0] = step_dt
                         flag = ""
-                        if (_baseline[0] is not None and steps_done > 1
+                        if (_baseline[0] is not None and steps_done > 2
                                 and step_dt > _baseline[0] * 2.0):
                             if _steps_high is not None and step == _steps_high + 1:
                                 flag = "  — expert transition (compile warmup)"
