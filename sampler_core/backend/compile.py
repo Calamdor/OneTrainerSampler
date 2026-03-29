@@ -14,10 +14,21 @@ def strip_premature_compile(block_lists) -> None:
     which is too early (before LoRA).  Strip it so we can recompile after LoRA.
     """
     for blk_list in block_lists:
-        for blk in blk_list:
-            if hasattr(blk, 'checkpoint') and \
-                    blk.checkpoint._compiled_call_impl is not None:
-                del blk.checkpoint._compiled_call_impl
+        for block in blk_list:
+            target = _get_compilable(block)
+            if target._compiled_call_impl is not None:
+                del target._compiled_call_impl
+
+
+def _get_compilable(block):
+    """Return the module that should be compiled for a given block.
+
+    Offload path: the inner .checkpoint module (not the wrapper).
+    No-offload path: the block itself.
+    """
+    if hasattr(block, 'checkpoint') and isinstance(block.checkpoint, torch.nn.Module):
+        return block.checkpoint
+    return block
 
 
 def ensure_blocks_compiled(block_lists) -> None:
@@ -28,16 +39,8 @@ def ensure_blocks_compiled(block_lists) -> None:
     for _kwargs_to_args signature introspection.
     """
     for blk_list in block_lists:
-        for i in range(len(blk_list)):
-            block = blk_list[i]
-            # Offload path: compile the INNER block, not the wrapper.
-            if hasattr(block, 'checkpoint') and \
-                    isinstance(block.checkpoint, torch.nn.Module):
-                if block.checkpoint._compiled_call_impl is not None:
-                    continue
-                block.checkpoint.compile(fullgraph=True)
+        for block in blk_list:
+            target = _get_compilable(block)
+            if target._compiled_call_impl is not None:
                 continue
-            # No-offload path: compile the block directly.
-            if block._compiled_call_impl is not None:
-                continue
-            block.compile(fullgraph=True)
+            target.compile(fullgraph=True)

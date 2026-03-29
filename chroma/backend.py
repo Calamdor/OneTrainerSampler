@@ -248,9 +248,9 @@ class ChromaBackend(BaseSamplerBackend):
         state_dict = expand_diffusion_model_fused(state_dict)
         translator = make_chroma_translator(self.model.transformer, self.model.text_encoder)
         on_log = getattr(self, "_on_log", None)
-        
+
         compile_friendly = getattr(self, '_compile_deferred', False)
-            
+
         return apply_lora_hooks(
             self.model.transformer,
             self.model.text_encoder,

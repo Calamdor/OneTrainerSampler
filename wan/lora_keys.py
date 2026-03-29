@@ -37,7 +37,7 @@ def _detect_expert_from_filename(path: str) -> str:
     return "BOTH"
 
 
-def make_wan_translator(transformer):
+def make_wan_translator(transformer):  # noqa: ARG001 — kept for API symmetry with Chroma
     """Return a key_translator closure for apply_lora_hooks().
 
     Handles musubi-tuner format:

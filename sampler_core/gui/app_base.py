@@ -25,7 +25,7 @@ from sampler_core.util.config import load_config, save_config
 from sampler_core.util.ot_bridge import find_ot_workspace, find_ot_quant_cache
 from sampler_core.util.resolution import check_attn_backends
 from sampler_core.gui.tooltip import Tooltip  # noqa: F401 — re-exported for subclasses
-from sampler_core.gui.theme import apply_dark_theme, BG, BG_INPUT, FG, BG_WIDGET, FG_DIM
+from sampler_core.gui.theme import apply_dark_theme, BG, BG_INPUT, FG, FG_DIM
 
 # Optional drag-and-drop support (requires tkinterdnd2 and a TkinterDnD.Tk root).
 try:
@@ -116,7 +116,7 @@ class BaseSamplerApp(ABC):
         self._log_lines: list[str] = []
         self._log_win:  tk.Toplevel | None = None
         self._log_text: ScrolledText | None = None
-        
+
         # Redirect print() to log window for debug output
         import sys
         class _LogRedirect:
@@ -127,11 +127,11 @@ class BaseSamplerApp(ABC):
                     self.logger._append_log(msg.rstrip())
             def flush(self):
                 pass
-        
+
         # Save original stdout/stderr for error traceback printing
         self._orig_stdout = sys.stdout
         self._orig_stderr = sys.stderr
-        
+
         sys.stdout = _LogRedirect(self)
         sys.stderr = _LogRedirect(self)
 

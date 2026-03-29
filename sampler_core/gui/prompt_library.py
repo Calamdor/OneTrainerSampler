@@ -25,8 +25,7 @@ from collections import defaultdict
 from tkinter import ttk
 
 from sampler_core.gui.theme import (
-    BG, BG_INPUT, BG_PANEL, BG_WIDGET,
-    BLUE, BLUE_SEL, BORDER, FG, FG_DIM,
+    BG, BG_INPUT, BLUE, BLUE_SEL, BORDER, FG,
 )
 
 # ---------------------------------------------------------------------------
@@ -359,7 +358,6 @@ class PromptLibraryWindow:
         for entry in filtered:
             groups[_date_key(entry.get("created", ""))].append(entry)
 
-        today_key     = datetime.date.today().strftime("%Y-%m-%d")
         yesterday_key = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
 
         for date_key in sorted(groups.keys(), reverse=True):

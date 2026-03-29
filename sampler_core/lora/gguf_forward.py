@@ -124,8 +124,7 @@ class GGUFCompilePatch:
     def remove(self) -> None:
         self._module.forward = self._orig_forward
         for attr in ('_lora_factors', '_lora_d', '_lora_u',
-                     '_gguf_compile_dt', '_gguf_compile_dev',
-                     '_gguf_compile_is_fp8'):
+                     '_gguf_compile_dt', '_gguf_compile_dev'):
             try:
                 delattr(self._module, attr)
             except AttributeError:

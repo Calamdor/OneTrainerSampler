@@ -16,7 +16,7 @@ import os
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from sampler_core.gui.theme import apply_dark_theme, BG, FG, BLUE
+from sampler_core.gui.theme import apply_dark_theme, FG
 
 _SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
 _SAMPLERS_DIR    = os.path.normpath(os.path.join(_SCRIPT_DIR, "..", ".."))

@@ -14,7 +14,7 @@ import sampler_core  # noqa: F401 — inject OT path
 
 from sampler_core.gui.app_base import BaseSamplerApp
 from sampler_core.gui.tooltip import Tooltip
-from sampler_core.gui.theme import BG, BLUE, BG_INPUT, FG
+from sampler_core.gui.theme import BG, BLUE
 from sampler_core.util.dtype_maps import (
     TRANSFORMER_DTYPE_OPTIONS, TEXT_ENC_DTYPE_OPTIONS,
     COMPUTE_DTYPE_OPTIONS, SVD_DTYPE_OPTIONS,

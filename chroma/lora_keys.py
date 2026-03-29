@@ -342,8 +342,7 @@ def make_chroma_translator(transformer, text_encoder):
                 return ("transformer", translated) if translated else None
             m = re.match(r"^distilled_guidance_layer_layers_(\d+)_(.+)$", us)
             if m:
-                sub_map = {"in_layer": "in_layer", "out_layer": "out_layer"}
-                ext_sub = sub_map.get(m.group(2))
+                ext_sub = _CHROMA_DGL_SUB_MAP.get(m.group(2))
                 if ext_sub is None:
                     return None
                 translated = _translate_external_chroma_transformer_path(

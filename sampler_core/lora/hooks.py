@@ -30,7 +30,7 @@ from sampler_core.lora.gguf_forward import (
 )
 from sampler_core.lora.compile_forward import (
     quantized_compile_forward, QuantizedCompilePatch,
-    rebuild_merged_lora, move_lora_factors_to_device,
+    rebuild_merged_lora,
 )
 from sampler_core.lora.forward_patch import (
     make_forward_patch, log_first_patch,
