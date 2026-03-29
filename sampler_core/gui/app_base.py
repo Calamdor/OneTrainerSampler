@@ -210,11 +210,30 @@ class BaseSamplerApp(ABC):
         self.frame = self._left_frame
 
         self._build_model_frame(pad)
-        self._build_lora_panel(pad)
 
-        # ---- Generation frame ----------------------------------------
-        gen_frame = ttk.LabelFrame(self.frame, text="Generation")
-        gen_frame.pack(fill="x", **pad)
+        # Vertical PanedWindow for LoRA / Generation / Queue — user can
+        # drag the sashes to resize each section.
+        _left_paned = tk.PanedWindow(
+            self.frame, orient=tk.VERTICAL,
+            sashwidth=5, sashrelief="raised",
+            background=BG, bd=0,
+        )
+        _left_paned.pack(fill="both", expand=True)
+
+        # --- LoRA pane ---
+        _lora_pane = ttk.Frame(_left_paned)
+        _left_paned.add(_lora_pane, minsize=60, stretch="always")
+        _saved_frame = self.frame
+        self.frame = _lora_pane
+        self._build_lora_panel(pad)
+        self.frame = _saved_frame
+
+        # --- Generation pane (prompt + params + output) ---
+        _gen_pane = ttk.Frame(_left_paned)
+        _left_paned.add(_gen_pane, minsize=120, stretch="always")
+
+        gen_frame = ttk.LabelFrame(_gen_pane, text="Generation")
+        gen_frame.pack(fill="both", expand=True, **pad)
 
         r = 0
         r = self._build_prompt_widgets(gen_frame, r, pad)
@@ -222,8 +241,18 @@ class BaseSamplerApp(ABC):
         r = self._build_gen_controls(gen_frame, r, pad)
         gen_frame.columnconfigure(1, weight=1)
 
+        _saved_frame = self.frame
+        self.frame = _gen_pane
         self._build_output_panel(pad)
+        self.frame = _saved_frame
+
+        # --- Queue pane (log + queue tree) ---
+        _queue_pane = ttk.Frame(_left_paned)
+        _left_paned.add(_queue_pane, minsize=100, stretch="always")
+        _saved_frame = self.frame
+        self.frame = _queue_pane
         self._build_queue_panel(pad)
+        self.frame = _saved_frame
         self._build_right_panel(pad)
 
         # Token counter bindings (prompt text widget created in _build_prompt_widgets)
