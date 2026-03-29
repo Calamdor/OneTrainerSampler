@@ -3,7 +3,6 @@
 Implements BaseSamplerBackend.  load_model() reads all settings from the cfg
 dict so the GUI can pass a plain snapshot without keyword explosion.
 """
-import hashlib
 import os
 from contextlib import nullcontext
 
@@ -21,6 +20,9 @@ from sampler_core.util.png_meta import write_png_metadata, write_png_sidecar, wr
 from sampler_core.util.tokenizer_patch import patch_tokenizer_no_truncate
 from sampler_core.util.resolution import ATTN_BACKEND_ENUM_NAME, check_attn_backends
 from sampler_core.lora.hooks import apply_lora_hooks
+from sampler_core.backend.compile import strip_premature_compile, ensure_blocks_compiled
+from sampler_core.backend.offload_lora import setup_offload_lora_patch
+from sampler_core.util.text_cache import te_cache_key
 from wan.lora_keys import make_wan_translator, _detect_expert_from_filename
 
 from modules.model.WanModel import WanModel
@@ -29,7 +31,6 @@ from modules.modelSampler.WanSampler import WanSampler
 from modules.util.checkpointing_util import enable_checkpointing_for_wan_transformer
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.enum.DataType import DataType
-from modules.util.enum.GradientCheckpointingMethod import GradientCheckpointingMethod
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.ImageFormat import ImageFormat
 from modules.util.enum.VideoFormat import VideoFormat
@@ -38,25 +39,7 @@ from modules.util.ModelWeightDtypes import ModelWeightDtypes
 from modules.util.quantization_util import quantize_layers as _ot_quantize_layers
 
 
-def _te_cache_key(pos_prompt: str, neg_prompt: str, te_dtype: str) -> str:
-    """
-    Stable 24-char hex key for one (pos, neg, dtype) text-encoder cache entry.
-    Includes te_dtype so BF16 and INT8 encodings don't collide.
-    """
-    data = f"{pos_prompt}\x00{neg_prompt}\x00{te_dtype}"
-    return hashlib.sha256(data.encode("utf-8")).hexdigest()[:24]
-
-
-class _OffloadConfig:
-    """Minimal duck-type for OT's LayerOffloadConductor constructor."""
-    def __init__(self, train_device, temp_device, fraction, use_compile=False):
-        self.train_device                 = str(train_device)
-        self.temp_device                  = str(temp_device)
-        self.layer_offload_fraction       = float(fraction)
-        self.gradient_checkpointing       = GradientCheckpointingMethod.CPU_OFFLOADED
-        self.enable_activation_offloading = False
-        self.enable_async_offloading      = True
-        self.compile                      = use_compile
+from sampler_core.offload import OffloadConfig as _OffloadConfig
 
 
 class WanBackend(BaseSamplerBackend):
@@ -71,42 +54,13 @@ class WanBackend(BaseSamplerBackend):
     )
 
     # ------------------------------------------------------------------
+    def _block_lists(self):
+        return (self.model.transformer.blocks, self.model.transformer_2.blocks)
+
     def _ensure_blocks_compiled(self):
-        """Compile transformer blocks if deferred compilation was requested.
-
-        Called AFTER LoRA injection so dynamo's initial trace includes the
-        patched forwards.  Uses module.compile() (in-place) rather than
-        torch.compile() (OptimizedModule wrapper) so the block type is
-        preserved — critical for the offload path where _kwargs_to_args
-        introspects the block's forward signature.
-
-        Always fullgraph=True, matching OneTrainer.  All weight types are
-        compatible: GGUF dequant uses only standard torch ops (no
-        torch.compiler.disable wrapper), and quantized types (W8A8*,
-        NF4, FP8, INT8) use custom autograd Functions that dynamo traces
-        into seeing only standard ops.
-        """
-        if not getattr(self, '_compile_deferred', False):
+        if not getattr(self, '_compile_deferred', False) or self.model is None:
             return
-        if self.model is None:
-            return
-
-        for xfmr in (self.model.transformer, self.model.transformer_2):
-            for i in range(len(xfmr.blocks)):
-                block = xfmr.blocks[i]
-
-                # Offload path: compile the INNER block, not the wrapper.
-                if hasattr(block, 'checkpoint') and \
-                        isinstance(block.checkpoint, torch.nn.Module):
-                    if block.checkpoint._compiled_call_impl is not None:
-                        continue  # already compiled; cache was reset by remove_loras()
-                    block.checkpoint.compile(fullgraph=True)
-                    continue
-
-                # No-offload path: compile the block directly (in-place).
-                if block._compiled_call_impl is not None:
-                    continue
-                block.compile(fullgraph=True)
+        ensure_blocks_compiled(self._block_lists())
 
     # ------------------------------------------------------------------
     def load_model(self, cfg: dict, on_status) -> None:
@@ -268,13 +222,8 @@ class WanBackend(BaseSamplerBackend):
             model.transformer_2_offload_conductor = \
                 enable_checkpointing_for_wan_transformer(model.transformer_2, oc)
             if use_compile:
-                # Strip OT's premature fullgraph=True compile so we can
-                # recompile after LoRA injection with the right settings.
-                for xfmr in (model.transformer, model.transformer_2):
-                    for blk in xfmr.blocks:
-                        if hasattr(blk, 'checkpoint') and \
-                                blk.checkpoint._compiled_call_impl is not None:
-                            del blk.checkpoint._compiled_call_impl
+                strip_premature_compile(
+                    (model.transformer.blocks, model.transformer_2.blocks))
                 self._compile_deferred = True
         elif use_compile:
             # No offload: defer compilation to sample() so it happens AFTER
@@ -447,28 +396,10 @@ class WanBackend(BaseSamplerBackend):
             # --------------------------------------------------------------
 
             # ---- LoRA factor offload integration ----------------------------
-            # Monkey-patch offload_quantized so LoRA factors (_lora_d/_lora_u)
-            # move WITH the weights.  The conductor calls offload_quantized
-            # per-module when moving blocks between CPU/GPU.  By extending it,
-            # factors follow the same device as weights — correct for ANY
-            # offload percentage (50% keeps half on GPU permanently, 99% cycles
-            # all but ~1 block).
-            _offload_patched = False
-            if self.lora_hooks:
-                from modules.util import quantization_util as _qu
-                import modules.util.LayerOffloadConductor as _loc
-                _orig_offload_q = _qu.offload_quantized
-                def _patched_offload_q(module, device, non_blocking=False, allocator=None):
-                    _orig_offload_q(module, device, non_blocking, allocator)
-                    d = getattr(module, '_lora_d', None)
-                    if d is not None:
-                        module._lora_d = module._lora_d.to(device, non_blocking=non_blocking)
-                        module._lora_u = module._lora_u.to(device, non_blocking=non_blocking)
-                # Patch both the module AND the conductor's local reference
-                # (from-import creates a separate binding).
-                _qu.offload_quantized = _patched_offload_q
-                _loc.offload_quantized = _patched_offload_q
-                _offload_patched = True
+            _offload_cleanup = setup_offload_lora_patch(
+                has_lora=bool(self.lora_hooks),
+                model_has_conductor=True,  # Wan always uses offload
+            )
             # --------------------------------------------------------------
 
             # ---- UMT5 embedding cache ------------------------------------
@@ -490,7 +421,7 @@ class WanBackend(BaseSamplerBackend):
                     _cache_dir = os.path.join(
                         os.path.dirname(os.path.dirname(__file__)), "output")
                 _te_cache_dir  = os.path.join(_cache_dir, "te_cache")
-                _te_key        = _te_cache_key(
+                _te_key        = te_cache_key(
                     cfg.get("prompt", ""),
                     cfg.get("negative_prompt", ""),
                     cfg.get("text_enc_dtype", "BF16"),
@@ -582,9 +513,8 @@ class WanBackend(BaseSamplerBackend):
                 if attn_str == "SageAttn":
                     from sampler_core.util.sage_compile import unpatch_sage_attention
                     unpatch_sage_attention()
-                if _offload_patched:
-                    _qu.offload_quantized = _orig_offload_q
-                    _loc.offload_quantized = _orig_offload_q
+                if _offload_cleanup:
+                    _offload_cleanup()
                 if _et_patched:
                     self.model.encode_text = _et_orig
                 if _te_to_orig is not None:
