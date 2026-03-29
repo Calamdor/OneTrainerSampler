@@ -73,30 +73,33 @@ class _QuantizedWeightMerge:
     """
     Undoable LoRA weight merge for quantized modules (W8A8I, W8A8F, FP8).
 
-    Dequantizes the weight, adds the LoRA delta, re-quantizes, and stores
-    back.  Zero per-step overhead, zero LoRA VRAM — the delta is baked
-    into the weight.  On remove(), the process is reversed.
+    Accumulates LoRA deltas (d, u, scale) per module, then applies them
+    in ONE dequant→merge-all→requant pass via flush().  This avoids
+    N separate GPU round-trips when N LoRAs target the same module.
 
-    Inspired by ComfyUI-WanVideoWrapper's apply_lora() which merges LoRA
-    into quantized weights as the default strategy.
+    On remove(), the accumulated delta is subtracted in one pass.
     """
-    __slots__ = ("_module", "_d", "_u", "_scale", "_device")
+    __slots__ = ("_module", "_deltas", "_device")
 
-    def __init__(self, module: torch.nn.Module,
-                 d: torch.Tensor, u: torch.Tensor, scale: float,
-                 device: torch.device):
+    def __init__(self, module: torch.nn.Module, device: torch.device):
         self._module = module
-        self._d      = d
-        self._u      = u
-        self._scale  = scale
-        self._device = device  # GPU for quantization ops
+        self._deltas = []       # [(d, u, scale), ...] accumulated
+        self._device = device
 
-    def _apply_delta(self, sign: float) -> None:
+    def add(self, d: torch.Tensor, u: torch.Tensor, scale: float) -> None:
+        """Accumulate a LoRA delta (deferred — no GPU work yet)."""
+        self._deltas.append((d, u, scale))
+
+    def flush(self) -> None:
+        """Apply all accumulated deltas in one dequant→merge→requant pass."""
+        self._apply_all(1.0)
+
+    def _apply_all(self, sign: float) -> None:
         module = self._module
         w = module.weight.detach()
         orig_device = w.device
 
-        # Dequantize to float on GPU
+        # Dequantize to float on GPU (once)
         s = getattr(module, 'scale', None)
         if s is not None:
             w_float = w.to(device=self._device, dtype=torch.float32) * s.to(
@@ -104,12 +107,12 @@ class _QuantizedWeightMerge:
         else:
             w_float = w.to(device=self._device, dtype=torch.float32)
 
-        # Apply delta
-        delta = (sign * self._scale * (self._u @ self._d)).to(
-            device=self._device, dtype=torch.float32)
-        w_float.add_(delta)
+        # Merge ALL deltas (cheap — just float adds on GPU)
+        for d, u, sc in self._deltas:
+            delta = (sign * sc * (u @ d)).to(device=self._device, dtype=torch.float32)
+            w_float.add_(delta)
 
-        # Re-quantize
+        # Re-quantize (once)
         _dtype = getattr(module, '_dtype', w.dtype)
         if _dtype == torch.int8:
             from modules.util.quantization_util import quantize_int8_tensorwise
@@ -118,7 +121,6 @@ class _QuantizedWeightMerge:
             from modules.util.quantization_util import quantize_fp8_tensorwise
             w_q, new_scale = quantize_fp8_tensorwise(w_float)
         else:
-            # FP8 (LinearFp8) — uses fp8_dtype and _scale
             fp8_max = torch.finfo(torch.float8_e4m3fn).max
             abs_max = w_float.abs().max()
             new_scale = torch.clamp(abs_max, min=1e-12) / fp8_max
@@ -129,7 +131,7 @@ class _QuantizedWeightMerge:
             s.copy_(new_scale.to(device=s.device))
 
     def remove(self) -> None:
-        self._apply_delta(-1.0)
+        self._apply_all(-1.0)
 
 
 def _can_merge(module: torch.nn.Module) -> bool:
@@ -539,6 +541,7 @@ def apply_lora_hooks(
     hook_count = 0
     qcomp_count = 0
     gguf_count = 0
+    _qmerge_pending: dict[int, _QuantizedWeightMerge] = {}  # id(module) → handle
 
     for (target, mod_path), lora in loras.items():
         if "down" not in lora or "up" not in lora:
@@ -579,13 +582,18 @@ def apply_lora_hooks(
             merge_count += 1
 
         elif _can_merge_quantized(module):
-            # ---- Quantized merge: dequant → add delta → requantize -----------
-            # Zero per-step overhead, zero LoRA VRAM.  Works for W8A8I,
-            # W8A8F, FP8 (any module with a scale buffer and int8/fp8 weight).
+            # ---- Quantized merge: accumulate deltas, flush at end -----------
+            # Multiple LoRAs on the same module share ONE handle.  Deltas
+            # are accumulated, then flushed in a single dequant→merge→requant
+            # pass (not N separate GPU round-trips).
             dev = hint_device or torch.device("cuda")
-            qm = _QuantizedWeightMerge(module, d, u, scale, dev)
-            qm._apply_delta(1.0)
-            handles.append(qm)
+            # Reuse existing handle if module already has one from a previous LoRA
+            _qm_key = id(module)
+            if _qm_key not in _qmerge_pending:
+                qm = _QuantizedWeightMerge(module, dev)
+                _qmerge_pending[_qm_key] = qm
+                handles.append(qm)
+            _qmerge_pending[_qm_key].add(d, u, scale)
             qmerge_count += 1
 
         elif compile_friendly and _is_gguf_module(module):
@@ -680,6 +688,14 @@ def apply_lora_hooks(
                     w2.dtype if (w2 is not None and w2.dtype in _PLAIN)
                     else torch.bfloat16)
                 on_log(f"[LoRA] patch device={dev2} dtype={dt2}")
+
+    # ---- Flush batched quantized merges (one GPU round-trip per module) --
+    if _qmerge_pending:
+        if on_log:
+            on_log(f"[LoRA] Flushing {len(_qmerge_pending)} quantized weight merges …")
+        for qm in _qmerge_pending.values():
+            qm.flush()
+        _qmerge_pending.clear()
 
     # ---- Logging -------------------------------------------------------
     _log = on_log if on_log is not None else print
