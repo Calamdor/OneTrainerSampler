@@ -229,20 +229,38 @@ class BaseSamplerApp(ABC):
         self.frame = _saved_frame
 
         # --- Generation pane (prompt + params + output) ---
+        # Sub-PanedWindow: prompt (resizable) above params (fixed).
         _gen_pane = ttk.Frame(_left_paned)
         _left_paned.add(_gen_pane, minsize=120, stretch="always")
 
-        gen_frame = ttk.LabelFrame(_gen_pane, text="Generation")
-        gen_frame.pack(fill="both", expand=True, **pad)
+        _gen_inner = tk.PanedWindow(
+            _gen_pane, orient=tk.VERTICAL,
+            sashwidth=4, sashrelief="raised",
+            background=BG, bd=0,
+        )
+        _gen_inner.pack(fill="both", expand=True, **pad)
 
+        # Prompt sub-pane (resizable)
+        _prompt_pane = ttk.Frame(_gen_inner)
+        _gen_inner.add(_prompt_pane, minsize=50, stretch="always")
+        _prompt_frame = ttk.LabelFrame(_prompt_pane, text="Prompt")
+        _prompt_frame.pack(fill="both", expand=True)
+        self._build_prompt_widgets(_prompt_frame, 0, pad)
+        _prompt_frame.columnconfigure(1, weight=1)
+        _prompt_frame.rowconfigure(0, weight=1)
+
+        # Params sub-pane (fixed height)
+        _params_pane = ttk.Frame(_gen_inner)
+        _gen_inner.add(_params_pane, minsize=60, stretch="never")
+        gen_frame = ttk.LabelFrame(_params_pane, text="Generation")
+        gen_frame.pack(fill="x")
         r = 0
-        r = self._build_prompt_widgets(gen_frame, r, pad)
         r = self._build_gen_params(gen_frame, r)
         r = self._build_gen_controls(gen_frame, r, pad)
         gen_frame.columnconfigure(1, weight=1)
 
         _saved_frame = self.frame
-        self.frame = _gen_pane
+        self.frame = _params_pane
         self._build_output_panel(pad)
         self.frame = _saved_frame
 
@@ -267,7 +285,7 @@ class BaseSamplerApp(ABC):
     def _build_prompt_widgets(self, gen_frame, r: int, pad: dict) -> int:
         ttk.Label(gen_frame, text="Prompt:").grid(row=r, column=0, sticky="nw", **pad)
         _pf = ttk.Frame(gen_frame)
-        _pf.grid(row=r, column=1, columnspan=5, sticky="ew", **pad)
+        _pf.grid(row=r, column=1, columnspan=5, sticky="nsew", **pad)
         self._prompt_text = tk.Text(
             _pf, height=3, wrap="word", undo=True,
             font=("TkDefaultFont", 9), relief="flat", borderwidth=1,
