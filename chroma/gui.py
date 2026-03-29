@@ -556,6 +556,7 @@ class ChromaSamplerApp(BaseSamplerApp):
         ).pack(side="left", padx=(4, 2))
 
         row_frame.pack(fill="x", pady=1)
+        self._bind_mousewheel_recursive(row_frame)
         self._lora_rows.append(row)
         self._on_lora_frame_configure()
         self._save_cfg()

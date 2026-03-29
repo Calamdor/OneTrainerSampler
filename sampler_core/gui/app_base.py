@@ -316,7 +316,7 @@ class BaseSamplerApp(ABC):
     # ------------------------------------------------------------------
     def _build_lora_panel(self, pad: dict) -> None:
         lora_frame = ttk.LabelFrame(self.frame, text="LoRA List")
-        lora_frame.pack(fill="both", expand=False, **pad)
+        lora_frame.pack(fill="both", expand=True, **pad)
 
         add_row = ttk.Frame(lora_frame)
         add_row.pack(fill="x", pady=2)
@@ -328,7 +328,7 @@ class BaseSamplerApp(ABC):
 
         canvas_frame = ttk.Frame(lora_frame)
         canvas_frame.pack(fill="both", expand=True)
-        self._lora_canvas = tk.Canvas(canvas_frame, height=110, highlightthickness=0,
+        self._lora_canvas = tk.Canvas(canvas_frame, highlightthickness=0,
                                        background=BG)
         lora_scroll = ttk.Scrollbar(canvas_frame, orient="vertical",
                                     command=self._lora_canvas.yview)
@@ -342,6 +342,14 @@ class BaseSamplerApp(ABC):
         )
         self._lora_inner.bind("<Configure>", self._on_lora_frame_configure)
         self._lora_canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # Mousewheel scroll for LoRA list
+        def _on_mousewheel(event):
+            self._lora_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self._lora_canvas.bind("<MouseWheel>", _on_mousewheel)
+        self._lora_inner.bind("<MouseWheel>", _on_mousewheel)
+        # Also bind to children as they're added (handled in _add_lora_row)
+        self._lora_mousewheel_handler = _on_mousewheel
 
         self._build_lora_header(self._lora_inner)
 
@@ -1028,6 +1036,15 @@ class BaseSamplerApp(ABC):
     # ==================================================================
     # Shared LoRA panel logic
     # ==================================================================
+
+    def _bind_mousewheel_recursive(self, widget) -> None:
+        """Bind mousewheel scroll to a widget and all its descendants."""
+        handler = getattr(self, '_lora_mousewheel_handler', None)
+        if handler is None:
+            return
+        widget.bind("<MouseWheel>", handler)
+        for child in widget.winfo_children():
+            self._bind_mousewheel_recursive(child)
 
     def _on_lora_frame_configure(self, _event=None):
         self._lora_canvas.configure(scrollregion=self._lora_canvas.bbox("all"))
