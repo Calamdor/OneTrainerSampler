@@ -336,11 +336,6 @@ class ChromaBackend(BaseSamplerBackend):
                 else nullcontext()
             )
 
-            # Wrap SageAttention in custom_op for fullgraph=True compat.
-            if attn_str == "SageAttn":
-                from sampler_core.util.sage_compile import patch_sage_attention
-                patch_sage_attention()
-
             # ---- scheduler swap ------------------------------------------
             _orig_scheduler = self.model.noise_scheduler
             _base_cfg = dict(_orig_scheduler.config)
@@ -478,9 +473,6 @@ class ChromaBackend(BaseSamplerBackend):
             finally:
                 _cs_mod.tqdm = _orig_cs_tqdm
                 self.model.noise_scheduler = _orig_scheduler
-                if attn_str == "SageAttn":
-                    from sampler_core.util.sage_compile import unpatch_sage_attention
-                    unpatch_sage_attention()
                 if _offload_cleanup:
                     _offload_cleanup()
                 if _needs_mask_patch:
