@@ -431,6 +431,7 @@ class ChromaBackend(BaseSamplerBackend):
             _offload_patched = False
             if self.lora_hooks:
                 from modules.util import quantization_util as _qu
+                import modules.util.LayerOffloadConductor as _loc
                 _orig_offload_q = _qu.offload_quantized
                 def _patched_offload_q(module, device, non_blocking=False, allocator=None):
                     _orig_offload_q(module, device, non_blocking, allocator)
@@ -438,7 +439,10 @@ class ChromaBackend(BaseSamplerBackend):
                     if d is not None:
                         module._lora_d = module._lora_d.to(device, non_blocking=non_blocking)
                         module._lora_u = module._lora_u.to(device, non_blocking=non_blocking)
+                # Patch both the module AND the conductor's local reference
+                # (from-import creates a separate binding).
                 _qu.offload_quantized = _patched_offload_q
+                _loc.offload_quantized = _patched_offload_q
                 _offload_patched = True
                 if not getattr(self.model, 'transformer_offload_conductor', None):
                     # No offload: move all factors to GPU once.
@@ -546,6 +550,7 @@ class ChromaBackend(BaseSamplerBackend):
                 self.model.noise_scheduler = _orig_scheduler
                 if _offload_patched:
                     _qu.offload_quantized = _orig_offload_q
+                    _loc.offload_quantized = _orig_offload_q
                 if _needs_mask_patch:
                     _transformer.forward = _orig_tr_fwd
                 if _et_patched:

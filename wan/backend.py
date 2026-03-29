@@ -451,6 +451,7 @@ class WanBackend(BaseSamplerBackend):
             _offload_patched = False
             if self.lora_hooks:
                 from modules.util import quantization_util as _qu
+                import modules.util.LayerOffloadConductor as _loc
                 _orig_offload_q = _qu.offload_quantized
                 def _patched_offload_q(module, device, non_blocking=False, allocator=None):
                     _orig_offload_q(module, device, non_blocking, allocator)
@@ -458,7 +459,10 @@ class WanBackend(BaseSamplerBackend):
                     if d is not None:
                         module._lora_d = module._lora_d.to(device, non_blocking=non_blocking)
                         module._lora_u = module._lora_u.to(device, non_blocking=non_blocking)
+                # Patch both the module AND the conductor's local reference
+                # (from-import creates a separate binding).
                 _qu.offload_quantized = _patched_offload_q
+                _loc.offload_quantized = _patched_offload_q
                 _offload_patched = True
             # --------------------------------------------------------------
 
@@ -572,6 +576,7 @@ class WanBackend(BaseSamplerBackend):
                 self.model.noise_scheduler = _orig_scheduler
                 if _offload_patched:
                     _qu.offload_quantized = _orig_offload_q
+                    _loc.offload_quantized = _orig_offload_q
                 if _et_patched:
                     self.model.encode_text = _et_orig
                 if _te_to_orig is not None:
