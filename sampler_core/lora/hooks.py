@@ -150,8 +150,16 @@ def _can_merge(module: torch.nn.Module) -> bool:
 
 
 def _can_merge_quantized(module: torch.nn.Module) -> bool:
-    """Return True for quantized modules that support dequant→merge→requantize."""
+    """Return True for quantized modules that support dequant→merge→requantize.
+
+    Excludes SVDQuant (BaseLinearSVD) — SVD correction layers mean the
+    LoRA delta can't simply be merged into the quantized residual weight.
+    """
     if not hasattr(module, 'scale'):
+        return False
+    # SVDQuant wraps quantized linear with SVD correction (svd_up/svd_down).
+    # Merging LoRA into just the residual is wrong — must use forward path.
+    if hasattr(module, 'svd_up') or hasattr(module, 'svd_down'):
         return False
     w = getattr(module, "weight", None)
     if w is None:
@@ -181,6 +189,28 @@ def _gguf_dequant_weight(weight):
     """
     from diffusers.quantizers.gguf.utils import dequantize_gguf_tensor
     return dequantize_gguf_tensor(weight.detach())
+
+
+def _gguf_compile_forward_plain(self, x):
+    """Compile-friendly forward for plain GGUF modules (no requantization).
+
+    Dequantize → merge LoRA → F.linear.  No int8/fp8 requant — the
+    dequantized float weight is used directly for the matmul.
+    """
+    w = _gguf_dequant_weight(self.weight)
+    dt = self._gguf_compile_dt
+    w = w.to(device=self._gguf_compile_dev, dtype=dt)
+
+    if self._lora_d is not None:
+        w = w + self._lora_u @ self._lora_d
+
+    bias = self.bias
+    if bias is not None:
+        bias = bias.to(dtype=dt)
+
+    x_2d = x.reshape(-1, x.shape[-1])
+    y = F.linear(x_2d, w, bias)
+    return y.reshape(x.shape[:-1] + (y.shape[-1],))
 
 
 def _gguf_compile_forward_int8(self, x):
@@ -609,9 +639,17 @@ def apply_lora_hooks(
                 module._lora_factors = []
                 module._gguf_compile_dt = dt
                 module._gguf_compile_dev = dev
-                is_fp8 = getattr(module, '_dtype', None) == torch.float8_e4m3fn
-                module._gguf_compile_is_fp8 = is_fp8
-                forward_fn = _gguf_compile_forward_fp8 if is_fp8 else _gguf_compile_forward_int8
+                # Select forward variant:
+                # - GGUF_A8F (LinearGGUFA8 with fp8): fp8 requant path
+                # - GGUF_A8I (LinearGGUFA8 with int8): int8 requant path
+                # - Plain GGUF (GGUFLinear): dequant + F.linear, no requant
+                _mod_dtype = getattr(module, '_dtype', None)
+                if _mod_dtype == torch.float8_e4m3fn:
+                    forward_fn = _gguf_compile_forward_fp8
+                elif _mod_dtype == torch.int8:
+                    forward_fn = _gguf_compile_forward_int8
+                else:
+                    forward_fn = _gguf_compile_forward_plain
                 module.forward = types.MethodType(forward_fn, module)
                 handles.append(_GGUFCompilePatch(module, orig_fwd))
             else:
