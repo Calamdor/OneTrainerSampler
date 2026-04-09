@@ -141,6 +141,7 @@ class BaseSamplerApp(ABC):
         self._queue: list[dict] = []
         self._queue_running        = False
         self._queue_stop_requested = False
+        self._sweep_groups: dict   = {}   # sweep_id → tracking dict
 
         # Video player state
         self._video_frames:    list      = []
@@ -454,6 +455,15 @@ class BaseSamplerApp(ABC):
                 "Consecutive jobs with the same model settings skip the reload.\n"
                 "Each job runs with the settings captured at the time it was added,\n"
                 "so you can queue multiple jobs with different prompts/seeds.")
+        self._sweep_btn = ttk.Button(
+            btn_row, text="Sweep\u2026", command=self._open_sweep_dialog)
+        self._sweep_btn.pack(side="left", padx=2)
+        Tooltip(self._sweep_btn,
+                "Open the Parameter Sweep dialog.\n\n"
+                "Configure parameter axes with comma-separated values\n"
+                "(e.g. Steps: 20,30,40 and CFG: 3,4,5).\n"
+                "The cartesian product is queued automatically.\n"
+                "Results are saved to a timestamped subfolder with an HTML viewer.")
         _remove_btn = ttk.Button(btn_row, text="Remove", command=self._queue_remove_selected)
         _remove_btn.pack(side="left", padx=2)
         Tooltip(_remove_btn, "Remove the selected job(s) from the queue.\n"
@@ -703,6 +713,28 @@ class BaseSamplerApp(ABC):
             self._preview_label.config(image=self._preview_photo, text="")
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Step preview (TAESD)
+    # ------------------------------------------------------------------
+
+    def _on_step_preview(self, image) -> None:
+        """Update the preview panel with a TAESD-decoded step image."""
+        self._preview_pil_img = image
+        self._redraw_preview()
+
+    def _clear_preview_for_new_job(self) -> None:
+        """Clear stale preview/video when a new queue job starts."""
+        # Stop video playback
+        if self._video_playing:
+            self._video_playing = False
+            if self._video_after_id is not None:
+                self.root.after_cancel(self._video_after_id)
+                self._video_after_id = None
+        self._video_frames = []
+        self._preview_pil_img = None
+        self._preview_photo = None
+        self._preview_label.config(image="", text="")
 
     # ------------------------------------------------------------------
     # Video playback helpers
@@ -1145,6 +1177,116 @@ class BaseSamplerApp(ABC):
         self._queue.append({"cfg": cfg, "status": "Pending", "iid": iid})
         self._auto_start_queue()
 
+    # ── Sweep ─────────────────────────────────────────────────────────
+
+    def _get_model_type(self) -> str:
+        cls = type(self).__name__
+        return "wan" if "Wan" in cls else "chroma"
+
+    def _open_sweep_dialog(self) -> None:
+        from sampler_core.gui.sweep import SweepDialog, expand_sweep
+        self._save_cfg()
+        cfg = self._collect_cfg()
+        dialog = SweepDialog(self.root, self._get_model_type(), cfg)
+        self.root.wait_window(dialog.window)
+        result = dialog.result
+        if result is None:
+            return
+        cfgs = expand_sweep(cfg, result)
+        if cfgs:
+            self._queue_add_sweep(cfgs)
+
+    def _queue_add_sweep(self, cfgs: list[dict]) -> None:
+        import os as _os
+        meta0 = cfgs[0]["_sweep_meta"]
+        sweep_id = meta0["sweep_id"]
+        sweep_dir = meta0["sweep_dir"]
+        _os.makedirs(sweep_dir, exist_ok=True)
+
+        self._sweep_groups[sweep_id] = {
+            "sweep_id": sweep_id,
+            "sweep_dir": sweep_dir,
+            "axes": meta0["axes"],
+            "total": meta0["total"],
+            "results": [],
+            "model_type": self._get_model_type(),
+        }
+
+        for cfg in cfgs:
+            combo = cfg["_sweep_meta"]["combo_values"]
+            combo_str = ", ".join(f"{k}={v}" for k, v in combo.items())
+            seed_str = "rnd" if cfg.get("random_seed") else str(cfg.get("seed", 0))
+            total = self._get_total_steps(cfg)
+            w, h = cfg.get("width", 0), cfg.get("height", 0)
+            res_str = f"{w}\u00d7{h}" if w and h else cfg.get("aspect_ratio", "")
+            iid = self._queue_tree.insert("", "end", values=(
+                f"[sweep] {combo_str[:40]}", res_str, total, seed_str,
+                "", "", "Pending",
+            ))
+            self._queue.append({
+                "cfg": cfg, "status": "Pending", "iid": iid,
+                "_sweep_id": sweep_id,
+            })
+
+        self._append_log(f"[sweep] Queued {len(cfgs)} jobs → {sweep_dir}")
+        self._auto_start_queue()
+
+    def _on_sweep_job_done(self, cfg: dict, path: str | None) -> None:
+        """Record a sweep result and regenerate the HTML viewer."""
+        meta = cfg.get("_sweep_meta")
+        if not meta:
+            return
+        sweep_id = meta.get("sweep_id")
+        group = self._sweep_groups.get(sweep_id)
+        if not group:
+            return
+
+        group["results"].append({
+            "combo_index": meta["combo_index"],
+            "combo_values": meta["combo_values"],
+            "output_path": path,
+            "seed": cfg.get("seed"),
+            "status": "done" if path else "error",
+        })
+
+        try:
+            from sampler_core.gui.sweep import generate_sweep_html
+            html_path = generate_sweep_html(
+                group["sweep_dir"], group["axes"],
+                group["results"], group["total"])
+            if len(group["results"]) >= group["total"]:
+                import webbrowser
+                webbrowser.open(html_path)
+                self._append_log(
+                    f"[sweep] Complete! HTML viewer: {html_path}")
+        except Exception as exc:
+            self._append_log(f"[sweep] HTML generation error: {exc}")
+
+    def _on_sweep_job_error(self, cfg: dict, error_msg: str) -> None:
+        """Record a sweep error result and regenerate HTML."""
+        meta = cfg.get("_sweep_meta")
+        if not meta:
+            return
+        sweep_id = meta.get("sweep_id")
+        group = self._sweep_groups.get(sweep_id)
+        if not group:
+            return
+
+        group["results"].append({
+            "combo_index": meta["combo_index"],
+            "combo_values": meta["combo_values"],
+            "status": "error",
+            "error": error_msg[:100],
+        })
+
+        try:
+            from sampler_core.gui.sweep import generate_sweep_html
+            generate_sweep_html(
+                group["sweep_dir"], group["axes"],
+                group["results"], group["total"])
+        except Exception:
+            pass
+
     def _queue_remove_selected(self) -> None:
         for iid in self._queue_tree.selection():
             job = next((j for j in self._queue if j["iid"] == iid), None)
@@ -1211,6 +1353,8 @@ class BaseSamplerApp(ABC):
                 job["status"] = "Running"
                 cfg = job["cfg"]
                 self.root.after(0, self._queue_update_job, job)
+                # Clear stale preview/video from previous generation
+                self.root.after(0, self._clear_preview_for_new_job)
 
                 self.backend._cancel_event.clear()
 
@@ -1230,6 +1374,8 @@ class BaseSamplerApp(ABC):
                                         f"Load error: {str(exc)[:80]}")
                         self.root.after(0, self._set_model_status,
                                         f"Error: {exc}")
+                        self.root.after(0, self._on_sweep_job_error,
+                                        cfg, str(exc))
                         continue
 
                 remaining = sum(1 for j in self._queue if j["status"] == "Pending")
@@ -1315,14 +1461,20 @@ class BaseSamplerApp(ABC):
                     error_msg[0] = msg
                     self.root.after(0, self._append_log, f"[error] {msg}")
 
+                def _preview(img):
+                    self.root.after(0, self._on_step_preview, img)
+
                 _sample_t0 = time.monotonic()
-                self.backend.sample(cfg, _prog, _done, _error)
+                self.backend.sample(cfg, _prog, _done, _error,
+                                    on_preview=_preview)
                 _sample_elapsed = time.monotonic() - _sample_t0
 
                 if error_msg[0]:
                     job["status"] = "Error"
                     self.root.after(0, self._queue_status_var.set,
                                     f"Error: {error_msg[0][:60]}")
+                    self.root.after(0, self._on_sweep_job_error,
+                                    cfg, error_msg[0])
                 elif done_path[0] is None:
                     job["status"] = "Aborted"
                     self._queue_stop_requested = True
@@ -1378,6 +1530,9 @@ class BaseSamplerApp(ABC):
                 auto_save_prompt(cfg.get("prompt", ""), cfg.get("negative_prompt", ""), model)
             except Exception:
                 pass
+        # Sweep HTML regeneration
+        if cfg:
+            self._on_sweep_job_done(cfg, path)
 
     # ==================================================================
     # Token counter
