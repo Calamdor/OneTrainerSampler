@@ -34,9 +34,19 @@ def _prepare_weight_and_bias(self):
     """Shared setup: dequant → dtype/device → merge LoRA → get bias."""
     w = _gguf_dequant_weight(self.weight)
     dt = self._gguf_compile_dt
-    w = w.to(device=self._gguf_compile_dev, dtype=dt)
+    dev = self._gguf_compile_dev
+    w = w.to(device=dev, dtype=dt)
     if self._lora_d is not None:
-        w = w + self._lora_u @ self._lora_d
+        ld = self._lora_d
+        lu = self._lora_u
+        # Factors may be on CPU if offload conductor didn't move them
+        # (e.g. offload disabled).  Cache the move on the module.
+        if ld.device != dev:
+            ld = ld.to(device=dev)
+            lu = lu.to(device=dev)
+            self._lora_d = ld
+            self._lora_u = lu
+        w = w + lu @ ld
     bias = self.bias
     if bias is not None:
         bias = bias.to(dtype=dt)

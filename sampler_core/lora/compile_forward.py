@@ -13,7 +13,15 @@ def quantized_compile_forward(self, x):
     """Forward: original quantized forward + LoRA output-addition."""
     y = self._orig_forward_for_lora(x)
     if self._lora_d is not None:
-        y = y + F.linear(F.linear(x, self._lora_d), self._lora_u)
+        ld = self._lora_d
+        lu = self._lora_u
+        # Factors may be on CPU if offload conductor didn't move them.
+        if ld.device != x.device:
+            ld = ld.to(device=x.device)
+            lu = lu.to(device=x.device)
+            self._lora_d = ld
+            self._lora_u = lu
+        y = y + F.linear(F.linear(x, ld), lu)
     return y
 
 
