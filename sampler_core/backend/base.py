@@ -53,10 +53,12 @@ class BaseSamplerBackend(ABC):
         Implementations must set self._loaded_cfg = cfg on successful completion."""
 
     @abstractmethod
-    def sample(self, cfg: dict, on_progress, on_done, on_error) -> None:
+    def sample(self, cfg: dict, on_progress, on_done, on_error,
+               on_preview=None) -> None:
         """
         Run inference synchronously (called from a background thread).
         on_progress(step, total), on_done(path_or_None), on_error(msg).
+        on_preview(PIL.Image) — optional, called with step previews.
         """
 
     @abstractmethod
@@ -159,6 +161,12 @@ class BaseSamplerBackend(ABC):
             gc.collect()
             gc.collect()  # second pass catches any remaining cycles
             torch_gc()
+
+        try:
+            from sampler_core.preview.taesd import unload_decoders
+            unload_decoders()
+        except Exception:
+            pass
 
         if on_status:
             on_status("Unloaded")

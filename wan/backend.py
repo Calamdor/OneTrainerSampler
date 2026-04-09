@@ -293,7 +293,8 @@ class WanBackend(BaseSamplerBackend):
         return hooks
 
     # ------------------------------------------------------------------
-    def sample(self, cfg: dict, on_progress, on_done, on_error) -> None:
+    def sample(self, cfg: dict, on_progress, on_done, on_error,
+               on_preview=None) -> None:
         if self.model is None:
             on_error("Model not loaded")
             return
@@ -347,14 +348,38 @@ class WanBackend(BaseSamplerBackend):
         _heun_sched    = (scheduler_type == "Heun")
         cancel_event   = self._cancel_event
 
+        # ---- Step preview state (non-invasive: forward hook only) --------
+        _preview_data = [None, None]  # [hidden_states, model_output]
+        _preview_interval = 2
+        # ------------------------------------------------------------------
+
         def _progress(step, total):
             if cancel_event.is_set():
                 raise Cancelled()
             if _heun_sched:
-                # Heun exposes 2*steps-1 NFE ticks; map back to user-facing steps
                 on_progress((step + 1) // 2, (total + 1) // 2)
             else:
                 on_progress(step, total)
+            # Step preview via TAESD — skip first step (compile) and last (cleanup)
+            if (on_preview and _preview_data[0] is not None
+                    and step > 1 and step < total
+                    and step % _preview_interval == 0):
+                try:
+                    sample = _preview_data[0]
+                    model_out = _preview_data[1]
+                    if not hasattr(sample, 'device') or sample.is_meta:
+                        return
+                    _sched = self.model.noise_scheduler
+                    idx = (_sched.step_index or step) - 1
+                    if 0 <= idx < len(_sched.sigmas):
+                        sigma = _sched.sigmas[idx].item()
+                        x0 = (sample - sigma * model_out).detach()
+                        from sampler_core.preview.taesd import decode_preview
+                        img = decode_preview(
+                            x0, "wan", self.train_device)
+                        on_preview(img)
+                except Exception:
+                    pass
 
         try:
             _enum_name = ATTN_BACKEND_ENUM_NAME.get(attn_str)
@@ -483,6 +508,41 @@ class WanBackend(BaseSamplerBackend):
             _orig_ws_tqdm = _ws_mod.tqdm
             _ws_mod.tqdm = lambda *a, **kw: _tqdm_lib.tqdm(*a, **{**kw, "disable": True})
 
+            # ---- transformer forward hook for step preview -------------------
+            _preview_hook_handles = []
+            if on_preview:
+                def _preview_hook(module, args, kwargs, output):
+                    try:
+                        if torch._dynamo.is_compiling():
+                            return output
+                        hs = kwargs.get("hidden_states")
+                        if hs is None and len(args) > 0:
+                            hs = args[0]
+                        if hs is not None:
+                            _preview_data[0] = hs[:1].detach().clone()
+                        out = output[0] if isinstance(output, (tuple, list)) else output
+                        _preview_data[1] = out[:1].detach().clone()
+                    except Exception:
+                        pass
+                    return output
+                for _tr in (self.model.transformer, self.model.transformer_2):
+                    if _tr is not None:
+                        _preview_hook_handles.append(
+                            _tr.register_forward_hook(_preview_hook, with_kwargs=True))
+            # ------------------------------------------------------------------
+
+            # ---- VAE float32 upcast for color accuracy -----------------------
+            # The diffusers AutoencoderKLWan runs in BF16 when loaded as BF16,
+            # but accumulated BF16 precision loss through dozens of decoder conv
+            # layers causes a warm/orange color cast.  Kijai's ComfyUI wrapper
+            # explicitly upcasts to float32 in multiple places.  We upcast the
+            # entire VAE before sampling so WanSampler.sample() decodes in FP32.
+            _vae = self.model.vae
+            _vae_orig_dtype = _vae.dtype
+            if _vae_orig_dtype != torch.float32:
+                _vae.to(dtype=torch.float32)
+            # ------------------------------------------------------------------
+
             try:
                 if is_image:
                     with _ctx:
@@ -504,7 +564,11 @@ class WanBackend(BaseSamplerBackend):
                         )
             finally:
                 _ws_mod.tqdm = _orig_ws_tqdm
+                for _hh in _preview_hook_handles:
+                    _hh.remove()
                 self.model.noise_scheduler = _orig_scheduler
+                if _vae_orig_dtype != torch.float32:
+                    _vae.to(dtype=_vae_orig_dtype)
                 if _offload_cleanup:
                     _offload_cleanup()
                 if _et_patched:

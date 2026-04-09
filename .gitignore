@@ -15,6 +15,9 @@ te_cache/
 *.pt
 *.safetensors
 
+# TAESD preview decoder models (auto-downloaded)
+vae/*.pth
+
 # Claude Code local settings
 .claude/
 

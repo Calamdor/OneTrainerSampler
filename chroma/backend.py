@@ -263,7 +263,8 @@ class ChromaBackend(BaseSamplerBackend):
         )
 
     # ------------------------------------------------------------------
-    def sample(self, cfg: dict, on_progress, on_done, on_error) -> None:
+    def sample(self, cfg: dict, on_progress, on_done, on_error,
+               on_preview=None) -> None:
         if self.model is None:
             on_error("Model not loaded")
             return
@@ -315,14 +316,49 @@ class ChromaBackend(BaseSamplerBackend):
         cancel_event  = self._cancel_event
         _heun_sched   = (scheduler_type == "Heun")
 
+        # ---- Step preview state (non-invasive: forward hook only) --------
+        _preview_data = [None, None]  # [hidden_states, model_output]
+        _preview_interval = 2
+        _preview_h = int(cfg.get("height", 1024)) // 8
+        _preview_w = int(cfg.get("width", 1024)) // 8
+        _vae_cfg = self.model.vae.config if self.model.vae is not None else None
+        _vae_scale = float(getattr(_vae_cfg, "scaling_factor", 0.3611)) if _vae_cfg else 0.3611
+        _vae_shift = float(getattr(_vae_cfg, "shift_factor", 0.1159)) if _vae_cfg else 0.1159
+        _cfg_scale = float(cfg.get("cfg_scale", 3.5))
+        # ------------------------------------------------------------------
+
         def _progress(step, total):
             if cancel_event.is_set():
                 raise Cancelled()
             if _heun_sched:
-                # Heun exposes 2*steps-1 NFE ticks; map back to user-facing steps
                 on_progress((step + 1) // 2, (total + 1) // 2)
             else:
                 on_progress(step, total)
+            # Step preview via TAESD — uses data captured by transformer hook.
+            # Skip the last step (final image comes through the normal path)
+            # and skip step 1 (may contain FakeTensors from compile warmup).
+            if (on_preview and _preview_data[0] is not None
+                    and step > 1 and step < total
+                    and step % _preview_interval == 0):
+                try:
+                    sample = _preview_data[0]
+                    model_out = _preview_data[1]
+                    # Guard: skip if tensors look invalid (FakeTensor from compile)
+                    if not hasattr(sample, 'device') or sample.is_meta:
+                        return
+                    _sched = self.model.noise_scheduler
+                    idx = (_sched.step_index or step) - 1
+                    if 0 <= idx < len(_sched.sigmas):
+                        sigma = _sched.sigmas[idx].item()
+                        x0 = (sample - sigma * model_out).detach()
+                        from sampler_core.preview.taesd import decode_preview
+                        img = decode_preview(
+                            x0, "chroma", self.train_device,
+                            unpack_hw=(_preview_h, _preview_w),
+                            vae_scale=_vae_scale, vae_shift=_vae_shift)
+                        on_preview(img)
+                except Exception:
+                    pass  # preview is best-effort
 
         try:
             _enum_name = ATTN_BACKEND_ENUM_NAME.get(attn_str)
@@ -462,6 +498,41 @@ class ChromaBackend(BaseSamplerBackend):
             _orig_cs_tqdm = _cs_mod.tqdm
             _cs_mod.tqdm = lambda *a, **kw: _tqdm_lib.tqdm(*a, **{**kw, "disable": True})
 
+            # ---- transformer forward hook for step preview -------------------
+            # Captures (hidden_states, model_output) without touching the
+            # scheduler or modifying any computation.  The hook fires during
+            # transformer(), and the progress callback reads the captured data.
+            _preview_hook_handle = None
+            if on_preview:
+                _tr = self.model.transformer
+                def _preview_hook(module, args, kwargs, output):
+                    try:
+                        # Skip during torch.compile tracing (FakeTensors)
+                        if torch._dynamo.is_compiling():
+                            return output
+                        hs = kwargs.get("hidden_states")
+                        if hs is None and len(args) > 0:
+                            hs = args[0]
+                        if hs is not None:
+                            _preview_data[0] = hs[:1].detach().clone()
+                        out = output.sample if hasattr(output, "sample") else output
+                        if isinstance(out, (tuple, list)):
+                            out = out[0]
+                        _preview_data[1] = out[:1].detach().clone()
+                    except Exception:
+                        pass
+                    return output
+                _preview_hook_handle = _tr.register_forward_hook(
+                    _preview_hook, with_kwargs=True)
+            # ------------------------------------------------------------------
+
+            # ---- VAE float32 upcast for color accuracy -----------------------
+            _vae = self.model.vae
+            _vae_orig_dtype = _vae.dtype
+            if _vae_orig_dtype != torch.float32:
+                _vae.to(dtype=torch.float32)
+            # ------------------------------------------------------------------
+
             try:
                 with _ctx:
                     sampler.sample(
@@ -473,6 +544,10 @@ class ChromaBackend(BaseSamplerBackend):
             finally:
                 _cs_mod.tqdm = _orig_cs_tqdm
                 self.model.noise_scheduler = _orig_scheduler
+                if _vae_orig_dtype != torch.float32:
+                    _vae.to(dtype=_vae_orig_dtype)
+                if _preview_hook_handle is not None:
+                    _preview_hook_handle.remove()
                 if _offload_cleanup:
                     _offload_cleanup()
                 if _needs_mask_patch:
