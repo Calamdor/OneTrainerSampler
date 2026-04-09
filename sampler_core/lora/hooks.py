@@ -35,6 +35,11 @@ from sampler_core.lora.compile_forward import (
 from sampler_core.lora.forward_patch import (
     make_forward_patch, log_first_patch,
 )
+from sampler_core.lora.oft import (
+    compute_oft_rotation, _rotate_weight,
+    _OFTWeightMerge, _OFTCompilePatch, _oft_compile_forward,
+    make_oft_forward_patch,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +83,7 @@ def apply_lora_hooks(
             (".lora_A.weight", "down"), (".lora_down.weight", "down"),
             (".lora_B.weight", "up"),   (".lora_up.weight", "up"),
             (".alpha", "alpha"),
+            (".oft_R.weight", "oft_R"),
         ]:
             if not key.endswith(suf):
                 continue
@@ -92,10 +98,60 @@ def apply_lora_hooks(
 
     # ---- Dispatch each LoRA entry to the right path --------------------
     handles = []
-    counts = {"merge": 0, "qmerge": 0, "gguf": 0, "qcomp": 0, "hook": 0, "fail": 0}
+    counts = {"merge": 0, "qmerge": 0, "gguf": 0, "qcomp": 0, "hook": 0, "fail": 0,
+              "oft": 0}
     _qmerge_pending: dict[int, _QuantizedWeightMerge] = {}
 
     for (target, mod_path), lora in loras.items():
+        # ---- OFT entries (single tensor, not a down/up pair) ----
+        if "oft_R" in lora:
+            root = transformer if target == "transformer" else text_encoder
+            if root is None:
+                continue
+            try:
+                module = get_module_by_dotpath(root, mod_path)
+            except AttributeError:
+                if on_log:
+                    on_log(f"[OFT-LOOKUP-FAIL] {target}:{mod_path} — AttributeError")
+                counts["fail"] += 1
+                continue
+
+            oft_param = lora["oft_R"].float().cpu()
+            R = compute_oft_rotation(oft_param, scale=weight)
+            r, bs, _ = R.shape
+            in_features = r * bs
+
+            # Dimension guard: R block structure must match module in_features
+            mod_in = getattr(module, "in_features", None)
+            if mod_in is None:
+                w = getattr(module, "weight", None)
+                if w is not None and w.ndim >= 2:
+                    mod_in = w.shape[1]
+            if mod_in is not None and mod_in != in_features:
+                if on_log:
+                    on_log(f"[OFT-DIM-FAIL] {target}:{mod_path} — OFT in_features="
+                           f"{in_features}, module={mod_in} — SKIPPED")
+                counts["fail"] += 1
+                continue
+
+            if can_merge(module):
+                _rotate_weight(module, R)
+                handles.append(_OFTWeightMerge(module, R))
+                counts["oft"] += 1
+            elif compile_friendly:
+                dt = getattr(module, "compute_dtype", None) or torch.bfloat16
+                module._oft_R = R.to(dtype=dt)
+                module._oft_r = r
+                module._oft_bs = bs
+                module._orig_forward_for_oft = module.forward
+                module.forward = types.MethodType(_oft_compile_forward, module)
+                handles.append(_OFTCompilePatch(module, module._orig_forward_for_oft))
+                counts["oft"] += 1
+            else:
+                handles.append(make_oft_forward_patch(module, R, hint_device))
+                counts["oft"] += 1
+            continue
+
         if "down" not in lora or "up" not in lora:
             continue
         root = transformer if target == "transformer" else text_encoder
@@ -202,7 +258,7 @@ def apply_lora_hooks(
     # ---- Summary log ---------------------------------------------------
     _log = on_log if on_log is not None else print
     total_parsed = len(loras)
-    ok = counts["merge"] + counts["qmerge"] + counts["gguf"] + counts["qcomp"] + counts["hook"]
+    ok = counts["merge"] + counts["qmerge"] + counts["gguf"] + counts["qcomp"] + counts["hook"] + counts["oft"]
     if total_parsed == 0:
         _log("[LoRA] no LoRA entries parsed — check key format")
         for k in list(state_dict.keys())[:8]:
@@ -229,6 +285,8 @@ def apply_lora_hooks(
             parts.append(f"{counts['gguf']} gguf-compile")
         if counts["qcomp"]:
             parts.append(f"{counts['qcomp']} compile-friendly")
+        if counts["oft"]:
+            parts.append(f"{counts['oft']} OFT-rotated")
         if counts["hook"]:
             parts.append(f"{counts['hook']} forward-patched")
         if skipped:
