@@ -103,8 +103,8 @@ def apply_dark_theme(root: tk.Tk) -> None:
     s.configure("TCheckbutton", background=BG, foreground=FG)
     s.map("TCheckbutton",
         background=[("active", BG)],
-        indicatorcolor=[("selected", BLUE), ("!selected", BG_INPUT)],
-        indicatorbackground=[("selected", BLUE_SEL), ("!selected", BG_INPUT)],
+        indicatorcolor=[("selected", "#ffffff"), ("!selected", BG_INPUT)],
+        indicatorbackground=[("selected", "#0e8a3e"), ("!selected", BG_INPUT)],
     )
 
     # ── Separator ─────────────────────────────────────────────────────────────

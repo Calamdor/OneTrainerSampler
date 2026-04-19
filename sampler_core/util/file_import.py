@@ -172,6 +172,31 @@ def _parse_comfyui_workflow(raw: str) -> dict | None:
     return {"prompt": pos or "", "negative_prompt": neg or ""}
 
 
+def _resolve_text_link(ref, nodes: dict, depth: int = 4) -> str | None:
+    """Follow a node link to resolve a plain text string.
+
+    Some workflows pipe text through intermediate nodes (e.g. Text Multiline,
+    ShowText, StringConstant).  This walks the link chain looking for a ``text``
+    or ``string`` input that is a plain string.
+    """
+    if depth <= 0 or not isinstance(ref, (list, tuple)) or len(ref) < 1:
+        return None
+    nid = str(ref[0])
+    node = nodes.get(nid)
+    if not isinstance(node, dict):
+        return None
+    inputs = node.get("inputs", {})
+    for key in ("text", "string", "value", "text_positive", "text_input"):
+        val = inputs.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+        if isinstance(val, (list, tuple)):
+            result = _resolve_text_link(val, nodes, depth - 1)
+            if result is not None:
+                return result
+    return None
+
+
 def _extract_comfyui_prompts(nodes: dict) -> tuple[str | None, str | None]:
     """Walk the ComfyUI node graph to extract positive/negative prompt text.
 
@@ -195,9 +220,14 @@ def _extract_comfyui_prompts(nodes: dict) -> tuple[str | None, str | None]:
             continue
         if node.get("class_type") == "CLIPTextEncode":
             text = node.get("inputs", {}).get("text", "")
-            # "text" can itself be a [node_id, slot] link — skip those
             if isinstance(text, str):
                 clip_texts[str(nid)] = text
+            elif isinstance(text, (list, tuple)) and len(text) >= 1:
+                # "text" is a link to another node (e.g. Text Multiline).
+                # Follow the link to find the actual string.
+                resolved = _resolve_text_link(text, nodes, depth=4)
+                if resolved is not None:
+                    clip_texts[str(nid)] = resolved
 
     # --- Find any node with explicit positive + negative conditioning refs ---
     def _is_link(v) -> bool:
