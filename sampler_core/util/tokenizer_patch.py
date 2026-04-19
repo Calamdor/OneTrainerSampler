@@ -11,9 +11,11 @@ Usage:
     patch_tokenizer_no_truncate(model)   # call once after model load
 
 This replaces model.tokenizer in-place with a wrapper that:
-  - Changes padding='max_length'  →  padding='longest'
-  - Changes truncation=True       →  truncation=False
-  - Drops any explicit max_length kwarg passed to __call__
+  - Probes actual token length and sets max_length = max(512, actual_len)
+  - Keeps padding='max_length' so short prompts still pad to 512 (the Wan
+    transformer goes out-of-distribution on sub-512 sequences and produces
+    garbage output)
+  - Disables truncation so prompts longer than 512 survive intact
   - Forwards all attribute access to the real tokenizer transparently
 
 OT's training code is unaffected — the patch is instance-level only.
@@ -32,13 +34,19 @@ class _NoTruncateTokenizer:
 
     def __call__(self, text, **kwargs):
         tok = object.__getattribute__(self, "_tok")
-        # Remove the hardcoded training limit
-        kwargs.pop("max_length", None)
-        # Don't truncate — T5 handles longer sequences fine
+        # Probe actual token length so short prompts still get 512-padded
+        # (the Wan transformer was trained with 512-token zero-padded inputs —
+        # shorter sequences go out-of-distribution and produce garbage output).
+        probe = tok(text, truncation=False, padding=False,
+                    add_special_tokens=kwargs.get("add_special_tokens", True))
+        ids = probe["input_ids"]
+        if ids and isinstance(ids[0], list):
+            actual_len = max((len(x) for x in ids), default=0)
+        else:
+            actual_len = len(ids)
+        kwargs["max_length"] = max(512, actual_len)
         kwargs["truncation"] = False
-        # Pad only to the actual sequence length, not to a fixed 512
-        if kwargs.get("padding") == "max_length":
-            kwargs["padding"] = "longest"
+        kwargs["padding"]    = "max_length"
         return tok(text, **kwargs)
 
     def __getattr__(self, name):
