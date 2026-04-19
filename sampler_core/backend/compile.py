@@ -31,6 +31,24 @@ def _get_compilable(block):
     return block
 
 
+def reset_compiled_blocks(block_lists) -> None:
+    """Strip existing compile from blocks and reset dynamo caches.
+
+    Call this when input shapes change (e.g. resolution change) so that
+    dynamo re-traces from scratch instead of using stale cached graphs.
+    """
+    stripped = 0
+    for blk_list in block_lists:
+        for block in blk_list:
+            target = _get_compilable(block)
+            if target._compiled_call_impl is not None:
+                del target._compiled_call_impl
+                stripped += 1
+    if stripped:
+        torch._dynamo.reset()
+        print(f"[compile] reset {stripped} compiled blocks (shape change)")
+
+
 def ensure_blocks_compiled(block_lists) -> None:
     """Compile transformer blocks in-place with fullgraph=True.
 

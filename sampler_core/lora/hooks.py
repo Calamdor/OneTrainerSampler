@@ -25,9 +25,7 @@ import torch
 from sampler_core.lora.merge import (
     _WeightMerge, _QuantizedWeightMerge, can_merge, can_merge_quantized,
 )
-from sampler_core.lora.gguf_forward import (
-    is_gguf_module, GGUFCompilePatch, FactorRef, select_gguf_forward,
-)
+from sampler_core.lora.gguf_forward import is_gguf_module, FactorRef
 from sampler_core.lora.compile_forward import (
     quantized_compile_forward, QuantizedCompilePatch,
     rebuild_merged_lora,
@@ -200,16 +198,19 @@ def apply_lora_hooks(
             counts["qmerge"] += 1
 
         # ---- Path 3: GGUF compile-friendly -----------------------------
+        # Use the same additive pattern as Path 4: call the ORIGINAL forward
+        # (LinearGGUFA8/GGUFLinear) unchanged + add LoRA separately.
+        # This matches OT's LoRAModule.forward which calls orig_forward(x)
+        # and adds the LoRA contribution.  The original GGUF forward handles
+        # dequant/A8 internally and is already compile-tested by OT.
         elif compile_friendly and is_gguf_module(module):
-            dev = hint_device or torch.device("cuda")
             dt = getattr(module, "compute_dtype", None) or torch.bfloat16
             if not hasattr(module, '_lora_factors'):
                 orig_fwd = module.forward
                 module._lora_factors = []
-                module._gguf_compile_dt = dt
-                module._gguf_compile_dev = dev
-                module.forward = types.MethodType(select_gguf_forward(module), module)
-                handles.append(GGUFCompilePatch(module, orig_fwd))
+                module._orig_forward_for_lora = orig_fwd
+                module.forward = types.MethodType(quantized_compile_forward, module)
+                handles.append(QuantizedCompilePatch(module, orig_fwd))
             else:
                 handles.append(FactorRef())
             dv = d.to(dtype=dt)
@@ -218,7 +219,7 @@ def apply_lora_hooks(
             rebuild_merged_lora(module)
             counts["gguf"] += 1
             if counts["gguf"] == 1 and on_log:
-                on_log(f"[LoRA] GGUF compile-friendly: dtype={dt} (factors on CPU)")
+                on_log(f"[LoRA] GGUF compile-friendly: dtype={dt} (additive, factors on CPU)")
 
         # ---- Path 4: quantized compile-friendly (non-GGUF) -------------
         elif compile_friendly:

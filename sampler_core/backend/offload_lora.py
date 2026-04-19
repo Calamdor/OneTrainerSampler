@@ -34,8 +34,11 @@ def setup_offload_lora_patch(has_lora: bool, model_has_conductor: bool,
         _orig(module, device, non_blocking, allocator)
         d = getattr(module, '_lora_d', None)
         if d is not None:
-            module._lora_d = module._lora_d.to(device, non_blocking=non_blocking)
-            module._lora_u = module._lora_u.to(device, non_blocking=non_blocking)
+            # Always synchronous for LoRA factors — async transfers on a
+            # separate stream can race with the compiled forward on the
+            # train stream, producing NaN from partially-transferred data.
+            module._lora_d = module._lora_d.to(device, non_blocking=False)
+            module._lora_u = module._lora_u.to(device, non_blocking=False)
 
     _qu.offload_quantized = _patched
     _loc.offload_quantized = _patched
