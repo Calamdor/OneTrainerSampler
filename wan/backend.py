@@ -20,8 +20,9 @@ from sampler_core.util.png_meta import write_png_metadata, write_png_sidecar, wr
 from sampler_core.util.tokenizer_patch import patch_tokenizer_no_truncate
 from sampler_core.util.resolution import ATTN_BACKEND_ENUM_NAME, check_attn_backends
 from sampler_core.lora.hooks import apply_lora_hooks
-from sampler_core.backend.compile import strip_premature_compile, ensure_blocks_compiled
+from sampler_core.backend.compile import strip_premature_compile, ensure_blocks_compiled, reset_compiled_blocks
 from sampler_core.backend.offload_lora import setup_offload_lora_patch
+from sampler_core.backend.wan_native_dtype import patch_wan_transformer, unpatch_wan_transformer
 from sampler_core.util.text_cache import te_cache_key
 from wan.lora_keys import make_wan_translator, _detect_expert_from_filename
 
@@ -126,15 +127,12 @@ class WanBackend(BaseSamplerBackend):
 
         if compute_dtype_override in COMPUTE_DTYPE_OVERRIDE:
             torch_compute, compute_dtype = COMPUTE_DTYPE_OVERRIDE[compute_dtype_override]
-            if compute_dtype_override == "FP16" and weight_dtype_str not in ("FP16",):
-                on_status(
-                    "⚠ WARNING: FP16 compute with non-FP16 weights — "
-                    "norm weights stay BF16, expect dtype mismatches. "
-                    "Use FP16 weight dtype or set Compute to Auto."
-                )
 
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = fast_fp16_accum
         if fast_fp16_accum:
+            # Also enable FP16 accumulation if available (PyTorch 2.7+, like Kijai's fp16_fast)
+            if hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"):
+                torch.backends.cuda.matmul.allow_fp16_accumulation = True
             on_status("Fast FP16 accumulation enabled")
 
         weight_dtypes = ModelWeightDtypes(
@@ -344,13 +342,13 @@ class WanBackend(BaseSamplerBackend):
         sample_config.steps_low        = int(cfg.get("steps_low", 0))
         sample_config.diffusion_steps  = sample_config.steps_high + sample_config.steps_low
 
-        scheduler_type = cfg.get("scheduler", "Euler")
-        _heun_sched    = (scheduler_type == "Heun")
+        scheduler_type = cfg.get("scheduler", "UniPC")
+        _heun_sched    = scheduler_type.startswith("Heun")
         cancel_event   = self._cancel_event
 
-        # ---- Step preview state (non-invasive: forward hook only) --------
-        _preview_data = [None, None]  # [hidden_states, model_output]
-        _preview_interval = 2
+        # ---- Step preview via on_update_preview callback -------------------
+        _preview_interval = 1
+        _preview_frames: list = []  # accumulated PIL frames for animated preview
         # ------------------------------------------------------------------
 
         def _progress(step, total):
@@ -360,26 +358,26 @@ class WanBackend(BaseSamplerBackend):
                 on_progress((step + 1) // 2, (total + 1) // 2)
             else:
                 on_progress(step, total)
-            # Step preview via TAESD — skip first step (compile) and last (cleanup)
-            if (on_preview and _preview_data[0] is not None
-                    and step > 1 and step < total
-                    and step % _preview_interval == 0):
-                try:
-                    sample = _preview_data[0]
-                    model_out = _preview_data[1]
-                    if not hasattr(sample, 'device') or sample.is_meta:
-                        return
-                    _sched = self.model.noise_scheduler
-                    idx = (_sched.step_index or step) - 1
-                    if 0 <= idx < len(_sched.sigmas):
-                        sigma = _sched.sigmas[idx].item()
-                        x0 = (sample - sigma * model_out).detach()
-                        from sampler_core.preview.taesd import decode_preview
-                        img = decode_preview(
-                            x0, "wan", self.train_device)
-                        on_preview(img)
-                except Exception:
-                    pass
+
+        # Latent temporal compression is 4x, so 81 video frames → 21 latent
+        # frames.  Final video plays at 16fps (5s).  Latent preview should
+        # play at 16/4 = 4fps to match the real video's perceived duration.
+        _latent_preview_fps = 4.0
+
+        def _on_preview(step, total, x0):
+            """Called from WanSampler with the post-CFG denoised x0 (B,C,T,H,W)."""
+            if not on_preview or step < 2 or step >= total:
+                return
+            if step % _preview_interval != 0:
+                return
+            try:
+                from sampler_core.preview.taesd import decode_wan_frames
+                frames = decode_wan_frames(x0, self.train_device)
+                _preview_frames.clear()
+                _preview_frames.extend(frames)
+                on_preview((_preview_frames, _latent_preview_fps))
+            except Exception:
+                pass
 
         try:
             _enum_name = ATTN_BACKEND_ENUM_NAME.get(attn_str)
@@ -397,29 +395,75 @@ class WanBackend(BaseSamplerBackend):
             # Wan2.2 calculates sigma shift automatically from the model config;
             # we preserve the original shift and only swap the scheduler class.
             _orig_scheduler = self.model.noise_scheduler
-            if scheduler_type == "Heun":
-                from diffusers import FlowMatchHeunDiscreteScheduler
-                _base_cfg = dict(_orig_scheduler.config)
-                self.model.noise_scheduler = FlowMatchHeunDiscreteScheduler(
-                    num_train_timesteps=_base_cfg.get("num_train_timesteps", 1000),
-                    shift=_base_cfg.get("shift", 1.0),
+            _base_cfg = dict(_orig_scheduler.config)
+            _nts = _base_cfg.get("num_train_timesteps", 1000)
+            # UniPC uses 'flow_shift'; Euler/Heun/LCM use 'shift'
+            _shift = _base_cfg.get("flow_shift", _base_cfg.get("shift", 3.0))
+            _beta = scheduler_type.endswith("/Beta")
+            _sched_base = scheduler_type.split("/")[0]
+
+            if _sched_base == "UniPC" and _beta:
+                from diffusers import UniPCMultistepScheduler
+                self.model.noise_scheduler = UniPCMultistepScheduler(
+                    num_train_timesteps=_nts, flow_shift=_shift,
+                    use_flow_sigmas=True, use_beta_sigmas=True,
+                    prediction_type="flow_prediction",
                 )
-            # Euler: keep existing scheduler (no shift override for Wan)
+            elif _sched_base == "Euler":
+                from diffusers import FlowMatchEulerDiscreteScheduler
+                self.model.noise_scheduler = FlowMatchEulerDiscreteScheduler(
+                    num_train_timesteps=_nts, shift=_shift,
+                    use_beta_sigmas=_beta,
+                )
+            elif _sched_base == "Heun":
+                from diffusers import FlowMatchHeunDiscreteScheduler
+                self.model.noise_scheduler = FlowMatchHeunDiscreteScheduler(
+                    num_train_timesteps=_nts, shift=_shift,
+                )
+            elif _sched_base == "LCM":
+                from diffusers import FlowMatchLCMScheduler
+                self.model.noise_scheduler = FlowMatchLCMScheduler(
+                    num_train_timesteps=_nts, shift=_shift,
+                    use_beta_sigmas=_beta,
+                )
+            # UniPC (no beta): keep existing scheduler (model default)
             # --------------------------------------------------------------
+
+            # Patch transformer blocks to use native-dtype (bf16) arithmetic
+            # for modulation, norms, and residuals — matches original Wan impl.
+            # Must run BEFORE compile so dynamo traces the patched forward.
+            patch_wan_transformer(self.model)
 
             # ---- deferred compile ----------------------------------------
             # Compile inner blocks AFTER LoRA injection so dynamo's trace
             # captures the patched forwards.  With compile-after-LoRA and
             # method-patching (not hooks), the compiled graph includes LoRA
             # — no need to swap to eager.
+            #
+            # When resolution changes, dynamo's cached graphs may produce
+            # garbage (extreme values that VAE decodes to NaN).  Reset
+            # compiled blocks so dynamo re-traces from scratch.
+            _shape_key = (sample_config.width, sample_config.height, sample_config.frames)
+            if getattr(self, '_last_compile_shape', None) != _shape_key:
+                if getattr(self, '_last_compile_shape', None) is not None:
+                    reset_compiled_blocks(self._block_lists())
+                self._last_compile_shape = _shape_key
             self._ensure_blocks_compiled()
             # --------------------------------------------------------------
 
             # ---- LoRA factor offload integration ----------------------------
+            _has_conductor = getattr(self.model, 'transformer_offload_conductor', None) is not None
             _offload_cleanup = setup_offload_lora_patch(
                 has_lora=bool(self.lora_hooks),
-                model_has_conductor=True,  # Wan always uses offload
+                model_has_conductor=_has_conductor,
+                transformer=self.model.transformer,
+                train_device=self.train_device,
             )
+            if not _has_conductor and bool(self.lora_hooks):
+                # No offload: also bulk-move transformer_2 factors
+                from sampler_core.lora.compile_forward import move_lora_factors_to_device
+                if self.model.transformer_2 is not None:
+                    move_lora_factors_to_device(self.model.transformer_2, self.train_device)
             # --------------------------------------------------------------
 
             # ---- UMT5 embedding cache ------------------------------------
@@ -508,40 +552,8 @@ class WanBackend(BaseSamplerBackend):
             _orig_ws_tqdm = _ws_mod.tqdm
             _ws_mod.tqdm = lambda *a, **kw: _tqdm_lib.tqdm(*a, **{**kw, "disable": True})
 
-            # ---- transformer forward hook for step preview -------------------
-            _preview_hook_handles = []
-            if on_preview:
-                def _preview_hook(module, args, kwargs, output):
-                    try:
-                        if torch._dynamo.is_compiling():
-                            return output
-                        hs = kwargs.get("hidden_states")
-                        if hs is None and len(args) > 0:
-                            hs = args[0]
-                        if hs is not None:
-                            _preview_data[0] = hs[:1].detach().clone()
-                        out = output[0] if isinstance(output, (tuple, list)) else output
-                        _preview_data[1] = out[:1].detach().clone()
-                    except Exception:
-                        pass
-                    return output
-                for _tr in (self.model.transformer, self.model.transformer_2):
-                    if _tr is not None:
-                        _preview_hook_handles.append(
-                            _tr.register_forward_hook(_preview_hook, with_kwargs=True))
-            # ------------------------------------------------------------------
-
-            # ---- VAE float32 upcast for color accuracy -----------------------
-            # The diffusers AutoencoderKLWan runs in BF16 when loaded as BF16,
-            # but accumulated BF16 precision loss through dozens of decoder conv
-            # layers causes a warm/orange color cast.  Kijai's ComfyUI wrapper
-            # explicitly upcasts to float32 in multiple places.  We upcast the
-            # entire VAE before sampling so WanSampler.sample() decodes in FP32.
-            _vae = self.model.vae
-            _vae_orig_dtype = _vae.dtype
-            if _vae_orig_dtype != torch.float32:
-                _vae.to(dtype=torch.float32)
-            # ------------------------------------------------------------------
+            # VAE decodes in its native dtype (bf16) — matches Kijai's ComfyUI
+            # WanVideo nodes which use bf16 precision for VAE decode.
 
             try:
                 if is_image:
@@ -552,6 +564,7 @@ class WanBackend(BaseSamplerBackend):
                             image_format=ImageFormat.PNG,
                             video_format=None,
                             on_update_progress=_progress,
+                            on_update_preview=_on_preview if on_preview else None,
                         )
                 else:
                     with _ctx:
@@ -561,20 +574,20 @@ class WanBackend(BaseSamplerBackend):
                             image_format=None,
                             video_format=VideoFormat.MP4,
                             on_update_progress=_progress,
+                            on_update_preview=_on_preview if on_preview else None,
                         )
             finally:
                 _ws_mod.tqdm = _orig_ws_tqdm
-                for _hh in _preview_hook_handles:
-                    _hh.remove()
                 self.model.noise_scheduler = _orig_scheduler
-                if _vae_orig_dtype != torch.float32:
-                    _vae.to(dtype=_vae_orig_dtype)
+                unpatch_wan_transformer(self.model)
+                _preview_frames.clear()  # release preview PIL frames
                 if _offload_cleanup:
                     _offload_cleanup()
                 if _et_patched:
                     self.model.encode_text = _et_orig
                 if _te_to_orig is not None:
                     self.model.text_encoder_to = _te_to_orig
+                torch.cuda.empty_cache()
 
             # Persist captured embeddings (only reached on clean success)
             if _et_save_file and any(c is not None for c in _et_captured):

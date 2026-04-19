@@ -45,7 +45,7 @@ DEFAULTS = {
     "offload_enabled":    False,
     "offload_fraction":   50,
     "attn_backend":       "Auto",
-    "scheduler":          "Euler",
+    "scheduler":          "UniPC",
     "text_cache_enabled": False,
     "loras":              [],
     "prompt":             "",
@@ -376,17 +376,25 @@ class WanSamplerApp(BaseSamplerApp):
                 "Set to 1 to generate a single image (PNG output, no sidecar).")
 
         ttk.Label(res_row, text="Scheduler:").pack(side="left")
-        self._scheduler_var = tk.StringVar(value=self.cfg.get("scheduler", "Euler"))
+        self._scheduler_var = tk.StringVar(value=self.cfg.get("scheduler", "UniPC"))
         _sched_cb = ttk.Combobox(
             res_row, textvariable=self._scheduler_var,
-            values=["Euler", "Heun"], state="readonly", width=6,
+            values=["UniPC", "UniPC/Beta",
+                    "Euler", "Euler/Beta",
+                    "Heun", "LCM", "LCM/Beta"],
+            state="readonly", width=10,
         )
         _sched_cb.pack(side="left", padx=(3, 0))
         Tooltip(_sched_cb,
                 "Diffusion scheduler.\n\n"
-                "Euler — standard first-order flow matching (default).\n"
+                "UniPC — UniPC multi-step (default, same as OneTrainer).\n"
+                "Euler — first-order flow-matching Euler.\n"
                 "Heun  — second-order predictor-corrector; higher quality\n"
-                "        at the same step count, but 2× NFE per step.\n\n"
+                "        at the same step count, but 2× NFE per step.\n"
+                "LCM   — Latent Consistency Model; designed for few-step\n"
+                "        inference (4-8 steps). Best with LCM-distilled LoRAs.\n\n"
+                "/Beta variants use the Beta-distribution sigma schedule\n"
+                "(arXiv:2407.12173) for improved denoising quality.\n\n"
                 "Wan2.2 calculates sigma shift automatically — no manual\n"
                 "shift control is needed.")
 
