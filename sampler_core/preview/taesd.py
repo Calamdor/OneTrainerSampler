@@ -241,27 +241,21 @@ def _ensure_model_file(model_type: str) -> Path:
     return path
 
 
-def get_decoder(model_type: str, device: torch.device) -> nn.Module:
-    """Load (and cache) the TAESD/TAEHV decoder for the given model type."""
+def get_decoder(model_type: str) -> nn.Module:
+    """Load (and cache) the TAESD decoder on CPU.  Caller moves to GPU."""
     if model_type in _decoder_cache:
-        dec = _decoder_cache[model_type]
-        if next(dec.parameters()).device == device:
-            return dec
-        dec.to(device)
-        return dec
+        return _decoder_cache[model_type]
 
     path = _ensure_model_file(model_type)
     sd = torch.load(str(path), map_location="cpu", weights_only=True)
 
     if model_type == "chroma":
         dec = TAESDDecoder(latent_channels=16)
-        # TAESD image files contain only decoder weights (no prefix)
         dec.taesd_decoder.load_state_dict(sd)
     else:
         raise ValueError(f"Unknown model_type for TAESD: {model_type}")
 
     dec.eval()
-    dec.to(device)
     _decoder_cache[model_type] = dec
     return dec
 
@@ -329,18 +323,22 @@ def decode_preview(
         PIL.Image.Image in RGB mode.
     """
     if model_type == "chroma":
-        dec = get_decoder(model_type, device)
-        if unpack_hw is not None:
-            x = unpack_chroma_latent(latent[:1], *unpack_hw)
-        else:
-            x = latent[:1]
-        x = x.to(device=device, dtype=torch.float32)
-        # Denormalize: diffusion space → VAE space
-        # ChromaSampler does: vae_latent = (diff_latent / scaling_factor) + shift_factor
-        _s = vae_scale if vae_scale is not None else 0.3611
-        _sh = vae_shift if vae_shift is not None else 0.1159
-        x = (x / _s) + _sh
-        rgb = dec.decode(x)           # (1, 3, H*8, W*8) in [-1, 1]
+        dec = get_decoder(model_type)
+        dec.to(device)
+        try:
+            if unpack_hw is not None:
+                x = unpack_chroma_latent(latent[:1], *unpack_hw)
+            else:
+                x = latent[:1]
+            x = x.to(device=device, dtype=torch.float32)
+            # Denormalize: diffusion space → VAE space
+            _s = vae_scale if vae_scale is not None else 0.3611
+            _sh = vae_shift if vae_shift is not None else 0.1159
+            x = (x / _s) + _sh
+            rgb = dec.decode(x)           # (1, 3, H*8, W*8) in [-1, 1]
+        finally:
+            dec.cpu()
+            torch.cuda.empty_cache()
 
     elif model_type == "wan":
         # Wan uses Latent2RGB (fast matrix multiply, no model needed).
@@ -380,3 +378,48 @@ def decode_preview(
         rgb = rgb.clamp(0, 1)                   # [0, 1] already
     rgb = rgb.mul(255).byte().permute(1, 2, 0).cpu().numpy()
     return Image.fromarray(rgb, "RGB")
+
+
+# ---------------------------------------------------------------------------
+# Wan multi-frame preview (Latent2RGB, all frames)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def decode_wan_frames(
+    x0: torch.Tensor,
+    device: torch.device,
+) -> list[Image.Image]:
+    """Decode ALL frames of a Wan x0 latent to a list of PIL Images.
+
+    Uses Latent2RGB (instant matrix multiply) for each frame.
+    Returns a list of PIL Images suitable for video playback in the preview.
+
+    Args:
+        x0: post-CFG denoised prediction (B, C, T, H, W) from on_update_preview.
+        device: GPU device.
+
+    Returns:
+        List of PIL.Image.Image in RGB mode, one per frame.
+    """
+    # x0 shape: (1, 16, T, H, W) — may be on CPU or GPU
+    if x0.ndim == 4:
+        x0 = x0.unsqueeze(2)
+    # Run Latent2RGB on CPU to avoid GPU memory pressure
+    x0 = x0[:1].float().cpu()
+    T = x0.shape[2]
+
+    factors = _WAN_RGB_FACTORS.float()
+    bias = _WAN_RGB_BIAS.float()
+
+    frames = []
+    for t in range(T):
+        frame = x0[0, :, t, :, :]   # (16, H, W)
+        rgb = F.linear(frame.movedim(0, -1), factors, bias)  # (H, W, 3)
+        rgb = (rgb + 1.0).div(2.0).clamp(0, 1)
+        rgb = rgb.mul(255).byte().cpu().numpy()
+        img = Image.fromarray(rgb, "RGB")
+        # Upscale from latent resolution to approximate output size
+        out_w, out_h = img.size[0] * 8, img.size[1] * 8
+        frames.append(img.resize((out_w, out_h), Image.LANCZOS))
+
+    return frames

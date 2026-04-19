@@ -20,7 +20,7 @@ from sampler_core.util.png_meta import write_png_metadata
 from sampler_core.util.tokenizer_patch import patch_tokenizer_no_truncate
 from sampler_core.util.resolution import ATTN_BACKEND_ENUM_NAME, check_attn_backends
 from sampler_core.lora.hooks import apply_lora_hooks
-from sampler_core.backend.compile import strip_premature_compile, ensure_blocks_compiled
+from sampler_core.backend.compile import strip_premature_compile, ensure_blocks_compiled, reset_compiled_blocks
 from sampler_core.backend.offload_lora import setup_offload_lora_patch
 from sampler_core.util.text_cache import te_cache_key
 from chroma.lora_keys import make_chroma_translator, expand_lora_unet_fused, expand_diffusion_model_fused
@@ -318,7 +318,7 @@ class ChromaBackend(BaseSamplerBackend):
 
         # ---- Step preview state (non-invasive: forward hook only) --------
         _preview_data = [None, None]  # [hidden_states, model_output]
-        _preview_interval = 2
+        _preview_interval = 1
         _preview_h = int(cfg.get("height", 1024)) // 8
         _preview_w = int(cfg.get("width", 1024)) // 8
         _vae_cfg = self.model.vae.config if self.model.vae is not None else None
@@ -394,10 +394,13 @@ class ChromaBackend(BaseSamplerBackend):
             # --------------------------------------------------------------
 
             # ---- deferred compile ----------------------------------------
-            # Compile inner blocks AFTER LoRA injection so dynamo's trace
-            # captures the patched forwards.  With compile-after-LoRA and
-            # method-patching (not hooks), the compiled graph includes LoRA
-            # — no need to swap to eager.
+            # Reset compiled blocks when resolution changes to avoid stale
+            # dynamo graphs producing garbage values.
+            _shape_key = (sample_config.width, sample_config.height)
+            if getattr(self, '_last_compile_shape', None) != _shape_key:
+                if getattr(self, '_last_compile_shape', None) is not None:
+                    reset_compiled_blocks(self._block_lists())
+                self._last_compile_shape = _shape_key
             self._ensure_blocks_compiled()
             # --------------------------------------------------------------
 
@@ -514,11 +517,11 @@ class ChromaBackend(BaseSamplerBackend):
                         if hs is None and len(args) > 0:
                             hs = args[0]
                         if hs is not None:
-                            _preview_data[0] = hs[:1].detach().clone()
+                            _preview_data[0] = hs[:1].detach().cpu()
                         out = output.sample if hasattr(output, "sample") else output
                         if isinstance(out, (tuple, list)):
                             out = out[0]
-                        _preview_data[1] = out[:1].detach().clone()
+                        _preview_data[1] = out[:1].detach().cpu()
                     except Exception:
                         pass
                     return output
@@ -526,12 +529,7 @@ class ChromaBackend(BaseSamplerBackend):
                     _preview_hook, with_kwargs=True)
             # ------------------------------------------------------------------
 
-            # ---- VAE float32 upcast for color accuracy -----------------------
-            _vae = self.model.vae
-            _vae_orig_dtype = _vae.dtype
-            if _vae_orig_dtype != torch.float32:
-                _vae.to(dtype=torch.float32)
-            # ------------------------------------------------------------------
+            # VAE decodes in its native dtype (bf16) — matches ComfyUI behavior.
 
             try:
                 with _ctx:
@@ -544,10 +542,9 @@ class ChromaBackend(BaseSamplerBackend):
             finally:
                 _cs_mod.tqdm = _orig_cs_tqdm
                 self.model.noise_scheduler = _orig_scheduler
-                if _vae_orig_dtype != torch.float32:
-                    _vae.to(dtype=_vae_orig_dtype)
                 if _preview_hook_handle is not None:
                     _preview_hook_handle.remove()
+                _preview_data[:] = [None, None]  # release preview tensors
                 if _offload_cleanup:
                     _offload_cleanup()
                 if _needs_mask_patch:
@@ -556,6 +553,7 @@ class ChromaBackend(BaseSamplerBackend):
                     self.model.encode_text = _et_orig
                 if _te_to_orig is not None:
                     self.model.text_encoder_to = _te_to_orig
+                torch.cuda.empty_cache()
 
             # Persist captured embeddings (only reached on clean success)
             if _et_save_file and _et_captured[0] is not None:

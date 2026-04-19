@@ -148,6 +148,7 @@ class BaseSamplerApp(ABC):
         self._video_frame_idx: int       = 0
         self._video_fps:       float     = 24.0
         self._video_playing:   bool      = False
+        self._video_loop:      bool      = True
         self._video_after_id:  str | None = None
 
         self._build_ui()
@@ -718,10 +719,27 @@ class BaseSamplerApp(ABC):
     # Step preview (TAESD)
     # ------------------------------------------------------------------
 
-    def _on_step_preview(self, image) -> None:
-        """Update the preview panel with a TAESD-decoded step image."""
-        self._preview_pil_img = image
-        self._redraw_preview()
+    def _on_step_preview(self, data) -> None:
+        """Update the preview panel with a step preview.
+
+        For Chroma: receives a single PIL Image.
+        For Wan video: receives (frames_list, fps) tuple → animated playback.
+        """
+        if isinstance(data, tuple) and len(data) == 2:
+            frames, fps = data
+            if isinstance(frames, list) and len(frames) > 1:
+                # Step preview: play through once then hold last frame.
+                # On subsequent updates, just swap the frames and restart.
+                self._start_video_playback(frames, fps=fps, loop=False)
+                return
+        if isinstance(data, list) and len(data) > 1:
+            self._start_video_playback(data, fps=4.0, loop=False)
+        elif isinstance(data, list) and len(data) == 1:
+            self._preview_pil_img = data[0]
+            self._redraw_preview()
+        else:
+            self._preview_pil_img = data
+            self._redraw_preview()
 
     def _clear_preview_for_new_job(self) -> None:
         """Clear stale preview/video when a new queue job starts."""
@@ -740,7 +758,8 @@ class BaseSamplerApp(ABC):
     # Video playback helpers
     # ------------------------------------------------------------------
 
-    def _start_video_playback(self, frames: list, fps: float) -> None:
+    def _start_video_playback(self, frames: list, fps: float,
+                              loop: bool = True) -> None:
         """Called on the main thread after background frame loading completes."""
         if not frames:
             self._preview_label.config(image="", text="Could not read video")
@@ -749,6 +768,7 @@ class BaseSamplerApp(ABC):
         self._video_frame_idx = 0
         self._video_fps       = max(1.0, fps)
         self._video_playing   = True
+        self._video_loop      = loop
         self._video_play_btn.config(text="⏸ Pause")
         self._video_tick()
 
@@ -771,7 +791,11 @@ class BaseSamplerApp(ABC):
                 pass
         self._video_frame_label_var.set(
             f"{self._video_frame_idx + 1} / {total}  ({self._video_fps:.1f} fps)")
-        self._video_frame_idx = (self._video_frame_idx + 1) % total
+        next_idx = self._video_frame_idx + 1
+        if next_idx >= total and not self._video_loop:
+            # Non-looping mode (step preview): hold on last frame
+            return
+        self._video_frame_idx = next_idx % total
         delay_ms = max(1, int(1000.0 / self._video_fps))
         self._video_after_id = self.root.after(delay_ms, self._video_tick)
 
@@ -810,7 +834,8 @@ class BaseSamplerApp(ABC):
 
             def _load():
                 frames, fps = _load_video_frames(path)
-                self.root.after(0, self._start_video_playback, frames, fps)
+                self.root.after(0, lambda: self._start_video_playback(
+                    frames, fps, loop=True))
 
             threading.Thread(target=_load, daemon=True).start()
         else:
